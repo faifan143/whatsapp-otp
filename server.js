@@ -15,13 +15,47 @@ try {
   console.error("Error checking session directory:", error);
 }
 
-// WhatsApp client setup
+// Determine a usable Chromium/Chrome/Edge executable
+function resolveExecutablePath() {
+  if (process.env.PUPPETEER_EXECUTABLE_PATH) {
+    return process.env.PUPPETEER_EXECUTABLE_PATH;
+  }
+
+  const windowsCandidates = [
+    "C:\\\\Program Files\\\\Google\\\\Chrome\\\\Application\\\\chrome.exe",
+    "C:\\\\Program Files (x86)\\\\Google\\\\Chrome\\\\Application\\\\chrome.exe",
+    "C:\\\\Program Files\\\\Microsoft\\\\Edge\\\\Application\\\\msedge.exe",
+    "C:\\\\Program Files (x86)\\\\Microsoft\\\\Edge\\\\Application\\\\msedge.exe",
+  ];
+
+  const linuxCandidates = [
+    "/usr/bin/chromium-browser",
+    "/usr/bin/chromium",
+    "/usr/bin/google-chrome",
+    "/usr/bin/google-chrome-stable",
+  ];
+
+  const candidates =
+    process.platform === "win32" ? windowsCandidates : linuxCandidates;
+
+  for (const candidate of candidates) {
+    if (fs.existsSync(candidate)) {
+      console.log(`Using detected browser executable: ${candidate}`);
+      return candidate;
+    }
+  }
+
+  console.warn(
+    "No browser executable found in default locations; falling back to Puppeteer's bundled Chromium (ensure 'puppeteer' package is installed)."
+  );
+  return undefined; // Allow puppeteer to use its bundled copy if present
+}
+
 const client = new Client({
   authStrategy: new LocalAuth({ clientId: "whatsapp-otp" }),
   puppeteer: {
     headless: true,
-    executablePath:
-      process.env.PUPPETEER_EXECUTABLE_PATH || "/usr/bin/chromium",
+    executablePath: resolveExecutablePath(),
     args: [
       "--no-sandbox",
       "--disable-setuid-sandbox",
