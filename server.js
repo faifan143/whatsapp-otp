@@ -193,21 +193,23 @@ app.get("/status", (req, res) => {
 
 // OTP endpoint with better error handling
 app.post("/send-otp", async (req, res) => {
-  const { phoneNumber, otp } = req.body;
+  const { phoneNumber, otp, purpose } = req.body;
 
-  console.log(`Received OTP request for phone: ${phoneNumber}`);
+  console.log(`Received OTP request for phone: ${phoneNumber}, purpose: ${purpose || 'not specified'}`);
 
   if (!phoneNumber || !otp) {
     return res.status(400).json({
       success: false,
-      error: "Phone number and OTP are required",
+      message: "Phone number and OTP are required",
+      otpSent: false,
     });
   }
 
   if (!isAuthenticated) {
     return res.status(503).json({
       success: false,
-      error: "WhatsApp service not ready. Please wait for authentication.",
+      message: "WhatsApp service not ready. Please wait for authentication.",
+      otpSent: false,
     });
   }
 
@@ -216,13 +218,14 @@ app.post("/send-otp", async (req, res) => {
     res.status(200).json({
       success: true,
       message: "OTP sent successfully",
+      otpSent: true,
     });
   } catch (error) {
     console.error("Failed to send OTP:", error);
     res.status(500).json({
       success: false,
-      error: "Failed to send OTP",
-      details: error.message,
+      message: "Failed to send OTP",
+      otpSent: false,
     });
   }
 });
@@ -236,14 +239,16 @@ app.post("/send-message", async (req, res) => {
   if (!phoneNumber || !message) {
     return res.status(400).json({
       success: false,
-      error: "Phone number and message are required",
+      message: "Phone number and message are required",
+      messageSent: false,
     });
   }
 
   if (!isAuthenticated) {
     return res.status(503).json({
       success: false,
-      error: "WhatsApp service not ready. Please wait for authentication.",
+      message: "WhatsApp service not ready. Please wait for authentication.",
+      messageSent: false,
     });
   }
 
@@ -251,14 +256,15 @@ app.post("/send-message", async (req, res) => {
     await sendCustomMessage(phoneNumber, message);
     res.status(200).json({
       success: true,
-      message: "Custom message sent successfully",
+      message: "Message sent successfully",
+      messageSent: true,
     });
   } catch (error) {
-    console.error("Failed to send custom message:", error);
+    console.error("Failed to send WhatsApp message:", error);
     res.status(500).json({
       success: false,
-      error: "Failed to send custom message",
-      details: error.message,
+      message: "Failed to send WhatsApp message",
+      messageSent: false,
     });
   }
 });
