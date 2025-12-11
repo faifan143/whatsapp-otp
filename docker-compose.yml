@@ -1,7 +1,7 @@
 version: "3.8"
 
 services:
-  whatsapp-otp:
+  whatsapp:
     build: .
     container_name: whatsapp-otp
     restart: unless-stopped
@@ -9,12 +9,7 @@ services:
       - "3002:3002"
     environment:
       - NODE_ENV=production
-      - PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=true
-      - PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium
-      # Optional: enable extra logs from the server code
-      - DEBUG_WWEBJS=1
+      - PORT=3002
     volumes:
-      # Persist LocalAuth between container rebuilds/restarts
-      - ./wwebjs_auth:/usr/src/app/.wwebjs_auth
-    # Optional but recommended for VPS headless Chrome stability
-    shm_size: "512mb"
+      - ./wwebjs_auth:/app/.wwebjs_auth
+    shm_size: 512mb
