@@ -1,31 +1,38 @@
 FROM node:18-bullseye
 
-# Install Chrome dependencies
+# Install Chromium + runtime deps commonly needed by headless Chromium
 RUN apt-get update && apt-get install -y \
     chromium \
+    ca-certificates \
+    fonts-liberation \
     fonts-ipafont-gothic fonts-wqy-zenhei fonts-thai-tlwg fonts-kacst fonts-freefont-ttf \
+    libnss3 libnspr4 \
+    libatk1.0-0 libatk-bridge2.0-0 \
+    libcups2 \
+    libxkbcommon0 \
+    libxcomposite1 libxdamage1 libxrandr2 \
+    libgbm1 \
+    libgtk-3-0 \
+    libasound2 \
     --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
-# Set environment variables for puppeteer
+# Instruct any puppeteer usage to NOT download Chromium
 ENV PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=true
 ENV PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium
+ENV NODE_ENV=production
 
-# Create app directory
 WORKDIR /usr/src/app
 
-# Copy package files and install dependencies
+# Install dependencies
 COPY package*.json ./
-RUN npm install
+RUN npm ci --omit=dev
 
-# Copy application code
+# Copy app code
 COPY . .
 
-# Fix permissions for the auth directory
-RUN mkdir -p .wwebjs_auth && chmod -R 777 .wwebjs_auth
+# Ensure auth directory exists (actual persistence is via volume mount)
+RUN mkdir -p .wwebjs_auth
 
-# Expose the port
 EXPOSE 3002
-
-# Start the application
 CMD ["node", "server.js"]
