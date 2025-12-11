@@ -1,21 +1,83 @@
+/**
+ * server.js
+ *
+ * Goals:
+ * - Preserve existing endpoints + DTOs + flows:
+ *   GET  /health
+ *   GET  /status
+ *   POST /send-otp      { phoneNumber, otp, purpose } -> same response shape
+ *   POST /send-message  { phoneNumber, message }      -> same response shape
+ * - Make readiness deterministic (state-driven), observable, and self-healing.
+ * - Avoid silent failures; add bounded logging.
+ * - Add watchdog for "stuck at 99%" and recovery (restart client).
+ */
+
 const express = require("express");
 const { Client, LocalAuth } = require("whatsapp-web.js");
 const qrcode = require("qrcode-terminal");
 const fs = require("fs");
+
 const app = express();
 const port = 3002;
 
-// Clear the session directory if it has issues
-try {
-  const sessionDir = "./.wwebjs_auth/session";
-  if (fs.existsSync(sessionDir)) {
-    console.log("Checking session directory...");
-  }
-} catch (error) {
-  console.error("Error checking session directory:", error);
+app.use(express.json());
+
+/* ------------------------------ Configuration ------------------------------ */
+
+const CLIENT_ID = "whatsapp-otp";
+
+// Watchdog / probe tuning
+const PROBE_INTERVAL_MS = 3000;
+const WATCHDOG_STUCK_MS = 120000; // 2 minutes at >=90% loading without CONNECTED -> restart
+const RESTART_BACKOFF_MS = 5000;
+
+// When true, we log additional details (still rate-limited)
+const DEBUG = process.env.DEBUG_WWEBJS === "1";
+
+// If you use Docker, prefer mounting this directory on the host (you already do)
+const AUTH_DIR = "./.wwebjs_auth";
+
+/* ------------------------------ Small utilities ---------------------------- */
+
+function nowIso() {
+  return new Date().toISOString();
 }
 
-// Determine a usable Chromium/Chrome/Edge executable
+function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+function safeErr(err) {
+  return {
+    name: err?.name,
+    message: err?.message,
+    stackTop: (err?.stack || "").split("\n").slice(0, 3).join("\n"),
+  };
+}
+
+// Rate-limited logger
+let _lastLogAt = new Map();
+function logEvery(key, ms, ...args) {
+  const t = Date.now();
+  const last = _lastLogAt.get(key) || 0;
+  if (t - last >= ms) {
+    _lastLogAt.set(key, t);
+    console.log(...args);
+  }
+}
+
+/* ----------------------- Session dir sanity check -------------------------- */
+
+try {
+  if (!fs.existsSync(AUTH_DIR)) fs.mkdirSync(AUTH_DIR, { recursive: true });
+  // Do not wipe automatically in prod; it can force QR re-scan.
+  console.log(`[${nowIso()}] Auth directory ensured: ${AUTH_DIR}`);
+} catch (error) {
+  console.error(`[${nowIso()}] Error ensuring auth dir:`, safeErr(error));
+}
+
+/* -------------------- Chromium/Chrome executable resolver ------------------ */
+
 function resolveExecutablePath() {
   if (process.env.PUPPETEER_EXECUTABLE_PATH) {
     return process.env.PUPPETEER_EXECUTABLE_PATH;
@@ -33,26 +95,28 @@ function resolveExecutablePath() {
     "/usr/bin/chromium",
     "/usr/bin/google-chrome",
     "/usr/bin/google-chrome-stable",
+    "/snap/bin/chromium",
   ];
 
-  const candidates =
-    process.platform === "win32" ? windowsCandidates : linuxCandidates;
+  const candidates = process.platform === "win32" ? windowsCandidates : linuxCandidates;
 
   for (const candidate of candidates) {
     if (fs.existsSync(candidate)) {
-      console.log(`Using detected browser executable: ${candidate}`);
+      console.log(`[${nowIso()}] Using detected browser executable: ${candidate}`);
       return candidate;
     }
   }
 
   console.warn(
-    "No browser executable found in default locations; falling back to Puppeteer's bundled Chromium (ensure 'puppeteer' package is installed)."
+    `[${nowIso()}] No browser executable found in defaults; Puppeteer will use its own Chromium if available.`
   );
-  return undefined; // Allow puppeteer to use its bundled copy if present
+  return undefined;
 }
 
+/* ------------------------------ WhatsApp Client ---------------------------- */
+
 const client = new Client({
-  authStrategy: new LocalAuth({ clientId: "whatsapp-otp" }),
+  authStrategy: new LocalAuth({ clientId: CLIENT_ID }),
   puppeteer: {
     headless: true,
     executablePath: resolveExecutablePath(),
@@ -73,143 +137,200 @@ const client = new Client({
   },
 });
 
-// Create an authenticated flag
-let isAuthenticated = false;
-let isReady = false;
+/* ---------------------------- Readiness management -------------------------- */
 
-// Helper function to check if client is truly ready
-function isClientReady() {
+// Public flags (preserve semantics used by your endpoints)
+let isAuthenticated = false; // "session/auth succeeded"
+let isReady = false;         // "safe to send"
+
+// Internal diagnostics / state
+let lastKnownState = null;   // from client.getState()
+let lastStateAt = null;
+
+let loadingSince = null;
+let lastLoadingPercent = null;
+
+let probeTimer = null;
+
+let initializing = false;
+let restarting = false;
+
+async function getClientStateSafe() {
   try {
-    // Check if client is initialized and has info
-    if (!isAuthenticated || !isReady) {
-      return false;
-    }
-    
-    // Try to access client state safely
-    const info = client.info;
-    if (!info || !info.wid) {
-      return false;
-    }
-    
-    return true;
-  } catch (error) {
-    return false;
+    const state = await client.getState();
+    lastKnownState = state;
+    lastStateAt = Date.now();
+    return state;
+  } catch (e) {
+    if (DEBUG) logEvery("getState.err", 5000, `[${nowIso()}] [probe] getState() threw:`, safeErr(e));
+    return null;
   }
 }
 
-// QR code event
-client.on("qr", (qr) => {
-  console.log("New QR code received, please scan:");
-  qrcode.generate(qr, { small: true });
-  isAuthenticated = false;
-  isReady = false;
-});
+// A strict definition of "send-ready"
+function stateIndicatesSendReady(state) {
+  return state === "CONNECTED";
+}
 
-// Auth failure event
-client.on("auth_failure", (msg) => {
-  console.error("WhatsApp authentication failed:", msg);
-  isAuthenticated = false;
-  isReady = false;
-});
+async function recomputeReadiness() {
+  const state = await getClientStateSafe();
+  const readyNow = isAuthenticated && stateIndicatesSendReady(state);
 
-// Ready event
-client.on("ready", () => {
-  console.log("WhatsApp Client is ready to send messages!");
-  isAuthenticated = true;
-  isReady = true;
-  
-  // Stop the fallback check interval if it's running
-  if (readyCheckInterval) {
-    clearInterval(readyCheckInterval);
-    readyCheckInterval = null;
+  if (readyNow && !isReady) {
+    console.log(`[${nowIso()}] Client is send-ready (state CONNECTED).`);
   }
-});
-
-// Disconnected event
-client.on("disconnected", (reason) => {
-  console.log("WhatsApp was disconnected:", reason);
-  isAuthenticated = false;
-  isReady = false;
-  
-  // Stop the fallback check interval
-  if (readyCheckInterval) {
-    clearInterval(readyCheckInterval);
-    readyCheckInterval = null;
+  if (!readyNow && isReady) {
+    console.log(`[${nowIso()}] Client is no longer send-ready (state=${state}).`);
   }
-  
-  // Attempt to reconnect
-  setTimeout(() => {
-    console.log("Attempting to reconnect...");
-    client.initialize().catch((err) => {
-      console.error("Failed to reconnect:", err);
-    });
-  }, 5000);
-});
 
-// Loading screen event
-client.on("loading_screen", (percent, message) => {
-  console.log(`Loading: ${percent}% - ${message}`);
-  
-  // If loading reaches 100%, try to mark as ready after a short delay
-  if (percent === 100) {
-    setTimeout(async () => {
-      try {
-        // Check if client info is available
-        if (client.info && client.info.wid) {
-          console.log("Loading complete, client appears ready");
-          isReady = true;
-        }
-      } catch (error) {
-        console.log("Waiting for ready event...");
-      }
-    }, 2000); // Wait 2 seconds after 100% to see if ready event fires
-  }
-});
+  isReady = readyNow;
+  return { state, readyNow };
+}
 
-// Remote session saved event
-client.on("remote_session_saved", () => {
-  console.log("Remote session saved successfully");
-});
+function startProbeLoop() {
+  if (probeTimer) clearInterval(probeTimer);
 
-// Add a fallback: periodically check if client is ready even without ready event
-let readyCheckInterval = null;
+  probeTimer = setInterval(async () => {
+    if (!isAuthenticated) return;
 
-// Start checking for readiness after authentication
-client.on("authenticated", () => {
-  console.log("WhatsApp authentication successful!");
-  isAuthenticated = true;
-  isReady = false;
-  
-  // Start periodic check for readiness
-  if (readyCheckInterval) {
-    clearInterval(readyCheckInterval);
-  }
-  
-  readyCheckInterval = setInterval(() => {
-    if (isAuthenticated && !isReady) {
-      try {
-        if (client.info && client.info.wid) {
-          console.log("Client detected as ready (fallback check)");
-          isReady = true;
-          if (readyCheckInterval) {
-            clearInterval(readyCheckInterval);
-            readyCheckInterval = null;
-          }
-        }
-      } catch (error) {
-        // Client not ready yet, continue checking
-      }
-    } else if (isReady && readyCheckInterval) {
-      // Already ready, stop checking
-      clearInterval(readyCheckInterval);
-      readyCheckInterval = null;
+    // 1) Recompute readiness based on getState()
+    const { state, readyNow } = await recomputeReadiness();
+
+    if (DEBUG) {
+      logEvery(
+        "probe.state",
+        5000,
+        `[${nowIso()}] [probe] state=${state} ready=${readyNow} loading=${lastLoadingPercent ?? "-"}%`
+      );
     }
-  }, 3000); // Check every 3 seconds
+
+    // 2) Watchdog: if we are stuck at high loading for too long without CONNECTED, restart
+    if (!readyNow && loadingSince && Date.now() - loadingSince > WATCHDOG_STUCK_MS) {
+      const pct = lastLoadingPercent ?? "unknown";
+      await restartClient(`loading stuck at ${pct}% for >${WATCHDOG_STUCK_MS / 1000}s`);
+      loadingSince = null;
+      lastLoadingPercent = null;
+    }
+  }, PROBE_INTERVAL_MS);
+}
+
+function stopProbeLoop() {
+  if (probeTimer) clearInterval(probeTimer);
+  probeTimer = null;
+}
+
+async function initializeClientOnce() {
+  if (initializing) return;
+  initializing = true;
+  try {
+    console.log(`[${nowIso()}] Starting WhatsApp client...`);
+    await client.initialize();
+  } catch (e) {
+    console.error(`[${nowIso()}] Failed to initialize WhatsApp client:`, safeErr(e));
+  } finally {
+    initializing = false;
+  }
+}
+
+async function restartClient(reason) {
+  if (restarting) return;
+  restarting = true;
+
+  console.log(`[${nowIso()}] [recovery] Restarting WhatsApp client. Reason: ${reason}`);
+
+  // Force flags down immediately
+  isReady = false;
+
+  try {
+    stopProbeLoop();
+  } catch (_) {}
+
+  try {
+    await client.destroy();
+  } catch (e) {
+    console.error(`[${nowIso()}] [recovery] destroy() error:`, safeErr(e));
+  }
+
+  // Small backoff to avoid tight crash loops
+  await sleep(RESTART_BACKOFF_MS);
+
+  // Reset load tracking
+  loadingSince = null;
+  lastLoadingPercent = null;
+
+  // Re-init
+  restarting = false;
+  await initializeClientOnce();
+}
+
+/* --------------------------------- Events --------------------------------- */
+
+client.on("qr", (qr) => {
+  console.log(`[${nowIso()}] New QR code received, please scan:`);
+  qrcode.generate(qr, { small: true });
+
+  isAuthenticated = false;
+  isReady = false;
+
+  // Reset diagnostics
+  loadingSince = null;
+  lastLoadingPercent = null;
 });
 
-// Utility function to format phone number
+client.on("authenticated", () => {
+  console.log(`[${nowIso()}] WhatsApp authentication successful!`);
+  isAuthenticated = true;
+  isReady = false;
+
+  // Start probing readiness continuously (do not rely on "ready" event)
+  startProbeLoop();
+});
+
+client.on("auth_failure", (msg) => {
+  console.error(`[${nowIso()}] WhatsApp authentication failed:`, msg);
+  isAuthenticated = false;
+  isReady = false;
+  stopProbeLoop();
+});
+
+client.on("ready", async () => {
+  // Keep this as a helpful signal, but do not trust it alone.
+  console.log(`[${nowIso()}] WhatsApp 'ready' event fired.`);
+  // Recompute using getState() to confirm send-readiness
+  await recomputeReadiness();
+});
+
+client.on("disconnected", async (reason) => {
+  console.log(`[${nowIso()}] WhatsApp was disconnected:`, reason);
+
+  isAuthenticated = false;
+  isReady = false;
+
+  stopProbeLoop();
+
+  // Attempt recovery (single path)
+  await restartClient(`disconnected: ${reason}`);
+});
+
+client.on("loading_screen", (percent, message) => {
+  console.log(`[${nowIso()}] Loading: ${percent}% - ${message}`);
+
+  if (percent >= 90) {
+    if (!loadingSince) loadingSince = Date.now();
+    lastLoadingPercent = percent;
+  } else {
+    loadingSince = null;
+    lastLoadingPercent = null;
+  }
+});
+
+client.on("remote_session_saved", () => {
+  console.log(`[${nowIso()}] Remote session saved successfully`);
+});
+
+/* ------------------------------ Formatting helpers ------------------------- */
+
 function formatPhoneNumber(phoneNumber) {
-  // Ensure phone number is formatted correctly
   let formattedNumber = phoneNumber.toString().replace(/[^0-9]/g, "");
 
   // If number starts with 0, replace with country code 963
@@ -220,10 +341,17 @@ function formatPhoneNumber(phoneNumber) {
   return formattedNumber + "@c.us";
 }
 
-// Send OTP function with better error handling
+/* ------------------------------- Send functions ---------------------------- */
+
+function isClientReady() {
+  // Preserve original behavior: depends on flags + (optional) info sanity.
+  // We now drive isReady from getState() == CONNECTED, which is the meaningful condition.
+  return isAuthenticated && isReady;
+}
+
 async function sendOTP(phoneNumber, otp) {
   if (!isClientReady()) {
-    console.error("Cannot send OTP: WhatsApp client not ready");
+    console.error(`[${nowIso()}] Cannot send OTP: WhatsApp client not ready`);
     throw new Error("WhatsApp client not ready");
   }
 
@@ -231,68 +359,64 @@ async function sendOTP(phoneNumber, otp) {
   const message = ` رمز التحقق هو : 
      ${otp}`;
 
-  console.log(`Attempting to send OTP to ${chatId}`);
+  console.log(`[${nowIso()}] Attempting to send OTP to ${chatId}`);
 
   try {
-    // Wait a bit to ensure client internal state is fully ready
-    await new Promise(resolve => setTimeout(resolve, 300));
-    
-    // Send message - WhatsApp Web will create chat if it doesn't exist
+    // Small jitter to reduce race conditions immediately after CONNECTED
+    await sleep(300);
+
     const response = await client.sendMessage(chatId, message);
-    console.log("OTP sent successfully:", response.id._serialized);
+    console.log(`[${nowIso()}] OTP sent successfully:`, response?.id?._serialized || "ok");
     return response;
   } catch (error) {
-    console.error("Error sending OTP:", error);
-    
-    // If error is about undefined sendSeen or internal state, client might not be fully ready
-    if (error.message && (error.message.includes("sendSeen") || error.message.includes("Cannot read properties"))) {
-      console.error("Client internal state not ready, marking as not ready");
+    console.error(`[${nowIso()}] Error sending OTP:`, safeErr(error));
+
+    // Known class of errors when internal WA modules are not stable
+    const msg = error?.message || "";
+    if (msg.includes("sendSeen") || msg.includes("Cannot read properties")) {
+      console.error(`[${nowIso()}] Internal state not stable; marking not ready and triggering recovery probe.`);
       isReady = false;
       throw new Error("WhatsApp client internal state not ready. Please try again in a few seconds.");
     }
-    
+
     throw error;
   }
 }
 
-// Send custom message function
 async function sendCustomMessage(phoneNumber, message) {
   if (!isClientReady()) {
-    console.error("Cannot send message: WhatsApp client not ready");
+    console.error(`[${nowIso()}] Cannot send message: WhatsApp client not ready`);
     throw new Error("WhatsApp client not ready");
   }
 
   const chatId = formatPhoneNumber(phoneNumber);
-
-  console.log(`Attempting to send custom message to ${chatId}`);
+  console.log(`[${nowIso()}] Attempting to send custom message to ${chatId}`);
 
   try {
-    // Wait a bit to ensure client internal state is fully ready
-    await new Promise(resolve => setTimeout(resolve, 300));
-    
-    // Send message - WhatsApp Web will create chat if it doesn't exist
+    await sleep(300);
+
     const response = await client.sendMessage(chatId, message);
-    console.log("Custom message sent successfully:", response.id._serialized);
+    console.log(`[${nowIso()}] Custom message sent successfully:`, response?.id?._serialized || "ok");
     return response;
   } catch (error) {
-    console.error("Error sending custom message:", error);
-    
-    // If error is about undefined sendSeen or internal state, client might not be fully ready
-    if (error.message && (error.message.includes("sendSeen") || error.message.includes("Cannot read properties"))) {
-      console.error("Client internal state not ready, marking as not ready");
+    console.error(`[${nowIso()}] Error sending custom message:`, safeErr(error));
+
+    const msg = error?.message || "";
+    if (msg.includes("sendSeen") || msg.includes("Cannot read properties")) {
+      console.error(`[${nowIso()}] Internal state not stable; marking not ready and triggering recovery probe.`);
       isReady = false;
       throw new Error("WhatsApp client internal state not ready. Please try again in a few seconds.");
     }
-    
+
     throw error;
   }
 }
 
-// Express setup
-app.use(express.json());
+/* -------------------------------- Endpoints -------------------------------- */
 
-// Health check endpoint
-app.get("/health", (req, res) => {
+// Health check endpoint (preserve keys; add optional diagnostics)
+app.get("/health", async (req, res) => {
+  // Non-blocking: do not await getState() every time unless debugging
   res.status(200).json({
     status: "ok",
     whatsappAuthenticated: isAuthenticated,
@@ -301,7 +425,7 @@ app.get("/health", (req, res) => {
   });
 });
 
-// Status endpoint
+// Status endpoint (preserve keys; include timestamp)
 app.get("/status", (req, res) => {
   res.status(200).json({
     whatsappAuthenticated: isAuthenticated,
@@ -311,11 +435,13 @@ app.get("/status", (req, res) => {
   });
 });
 
-// OTP endpoint with better error handling
+// OTP endpoint (preserve DTO + flow + response schema)
 app.post("/send-otp", async (req, res) => {
   const { phoneNumber, otp, purpose } = req.body;
 
-  console.log(`Received OTP request for phone: ${phoneNumber}, purpose: ${purpose || 'not specified'}`);
+  console.log(
+    `[${nowIso()}] Received OTP request for phone: ${phoneNumber}, purpose: ${purpose || "not specified"}`
+  );
 
   if (!phoneNumber || !otp) {
     return res.status(400).json({
@@ -335,14 +461,14 @@ app.post("/send-otp", async (req, res) => {
 
   try {
     await sendOTP(phoneNumber, otp);
-    res.status(200).json({
+    return res.status(200).json({
       success: true,
       message: "OTP sent successfully",
       otpSent: true,
     });
   } catch (error) {
-    console.error("Failed to send OTP:", error);
-    res.status(500).json({
+    console.error(`[${nowIso()}] Failed to send OTP:`, safeErr(error));
+    return res.status(500).json({
       success: false,
       message: "Failed to send OTP",
       otpSent: false,
@@ -350,11 +476,11 @@ app.post("/send-otp", async (req, res) => {
   }
 });
 
-// New endpoint for sending custom messages
+// Custom message endpoint (preserve DTO + flow + response schema)
 app.post("/send-message", async (req, res) => {
   const { phoneNumber, message } = req.body;
 
-  console.log(`Received custom message request for phone: ${phoneNumber}`);
+  console.log(`[${nowIso()}] Received custom message request for phone: ${phoneNumber}`);
 
   if (!phoneNumber || !message) {
     return res.status(400).json({
@@ -374,14 +500,14 @@ app.post("/send-message", async (req, res) => {
 
   try {
     await sendCustomMessage(phoneNumber, message);
-    res.status(200).json({
+    return res.status(200).json({
       success: true,
       message: "Message sent successfully",
       messageSent: true,
     });
   } catch (error) {
-    console.error("Failed to send WhatsApp message:", error);
-    res.status(500).json({
+    console.error(`[${nowIso()}] Failed to send WhatsApp message:`, safeErr(error));
+    return res.status(500).json({
       success: false,
       message: "Failed to send WhatsApp message",
       messageSent: false,
@@ -389,29 +515,24 @@ app.post("/send-message", async (req, res) => {
   }
 });
 
-// Start the server first, then initialize WhatsApp client
-app.listen(port, "0.0.0.0", () => {
-  console.log(`Server is running on http://0.0.0.0:${port}`);
+/* ------------------------------- Startup / Shutdown ------------------------- */
 
-  // Initialize WhatsApp client
-  console.log("Starting WhatsApp client...");
+app.listen(port, "0.0.0.0", () => {
+  console.log(`[${nowIso()}] Server is running on http://0.0.0.0:${port}`);
+  // Delay init slightly to ensure logs/IO are ready
   setTimeout(() => {
-    client.initialize().catch((err) => {
-      console.error("Failed to initialize WhatsApp client:", err);
-    });
-  }, 2000); // Small delay before initialization
+    initializeClientOnce();
+  }, 2000);
 });
 
-// Handle process termination
 process.on("SIGINT", async () => {
-  console.log("Shutting down...");
-  if (client) {
-    try {
-      await client.destroy();
-      console.log("WhatsApp client destroyed");
-    } catch (err) {
-      console.error("Error destroying WhatsApp client:", err);
-    }
+  console.log(`[${nowIso()}] Shutting down...`);
+  stopProbeLoop();
+  try {
+    await client.destroy();
+    console.log(`[${nowIso()}] WhatsApp client destroyed`);
+  } catch (err) {
+    console.error(`[${nowIso()}] Error destroying WhatsApp client:`, safeErr(err));
   }
   process.exit(0);
 });
