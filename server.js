@@ -75,40 +75,79 @@ const client = new Client({
 
 // Create an authenticated flag
 let isAuthenticated = false;
+let isReady = false;
+
+// Helper function to check if client is truly ready
+function isClientReady() {
+  try {
+    // Check if client is initialized and has info
+    if (!isAuthenticated || !isReady) {
+      return false;
+    }
+    
+    // Try to access client state safely
+    const info = client.info;
+    if (!info || !info.wid) {
+      return false;
+    }
+    
+    return true;
+  } catch (error) {
+    return false;
+  }
+}
 
 // QR code event
 client.on("qr", (qr) => {
   console.log("New QR code received, please scan:");
   qrcode.generate(qr, { small: true });
+  isAuthenticated = false;
+  isReady = false;
 });
 
 // Authentication event
 client.on("authenticated", () => {
   console.log("WhatsApp authentication successful!");
   isAuthenticated = true;
+  isReady = false; // Not ready yet, wait for 'ready' event
 });
 
 // Auth failure event
 client.on("auth_failure", (msg) => {
   console.error("WhatsApp authentication failed:", msg);
   isAuthenticated = false;
+  isReady = false;
 });
 
 // Ready event
 client.on("ready", () => {
   console.log("WhatsApp Client is ready to send messages!");
   isAuthenticated = true;
+  isReady = true;
 });
 
 // Disconnected event
 client.on("disconnected", (reason) => {
   console.log("WhatsApp was disconnected:", reason);
   isAuthenticated = false;
+  isReady = false;
   // Attempt to reconnect
   setTimeout(() => {
     console.log("Attempting to reconnect...");
-    client.initialize();
+    client.initialize().catch((err) => {
+      console.error("Failed to reconnect:", err);
+    });
   }, 5000);
+});
+
+// Loading screen event
+client.on("loading_screen", (percent, message) => {
+  console.log(`Loading: ${percent}% - ${message}`);
+});
+
+// Remote session saved event
+client.on("remote_session_saved", () => {
+  console.log("Remote session saved successfully");
 });
 
 // Utility function to format phone number
@@ -125,10 +164,10 @@ function formatPhoneNumber(phoneNumber) {
 }
 
 // Send OTP function with better error handling
-function sendOTP(phoneNumber, otp) {
-  if (!isAuthenticated) {
-    console.error("Cannot send OTP: WhatsApp client not authenticated");
-    return Promise.reject(new Error("WhatsApp client not authenticated"));
+async function sendOTP(phoneNumber, otp) {
+  if (!isClientReady()) {
+    console.error("Cannot send OTP: WhatsApp client not ready");
+    throw new Error("WhatsApp client not ready");
   }
 
   const chatId = formatPhoneNumber(phoneNumber);
@@ -137,39 +176,59 @@ function sendOTP(phoneNumber, otp) {
 
   console.log(`Attempting to send OTP to ${chatId}`);
 
-  return client
-    .sendMessage(chatId, message)
-    .then((response) => {
-      console.log("OTP sent successfully:", response.id._serialized);
-      return response;
-    })
-    .catch((error) => {
-      console.error("Error sending OTP:", error);
-      throw error;
-    });
+  try {
+    // Wait a bit to ensure client internal state is fully ready
+    await new Promise(resolve => setTimeout(resolve, 300));
+    
+    // Send message - WhatsApp Web will create chat if it doesn't exist
+    const response = await client.sendMessage(chatId, message);
+    console.log("OTP sent successfully:", response.id._serialized);
+    return response;
+  } catch (error) {
+    console.error("Error sending OTP:", error);
+    
+    // If error is about undefined sendSeen or internal state, client might not be fully ready
+    if (error.message && (error.message.includes("sendSeen") || error.message.includes("Cannot read properties"))) {
+      console.error("Client internal state not ready, marking as not ready");
+      isReady = false;
+      throw new Error("WhatsApp client internal state not ready. Please try again in a few seconds.");
+    }
+    
+    throw error;
+  }
 }
 
 // Send custom message function
-function sendCustomMessage(phoneNumber, message) {
-  if (!isAuthenticated) {
-    console.error("Cannot send message: WhatsApp client not authenticated");
-    return Promise.reject(new Error("WhatsApp client not authenticated"));
+async function sendCustomMessage(phoneNumber, message) {
+  if (!isClientReady()) {
+    console.error("Cannot send message: WhatsApp client not ready");
+    throw new Error("WhatsApp client not ready");
   }
 
   const chatId = formatPhoneNumber(phoneNumber);
 
   console.log(`Attempting to send custom message to ${chatId}`);
 
-  return client
-    .sendMessage(chatId, message)
-    .then((response) => {
-      console.log("Custom message sent successfully:", response.id._serialized);
-      return response;
-    })
-    .catch((error) => {
-      console.error("Error sending custom message:", error);
-      throw error;
-    });
+  try {
+    // Wait a bit to ensure client internal state is fully ready
+    await new Promise(resolve => setTimeout(resolve, 300));
+    
+    // Send message - WhatsApp Web will create chat if it doesn't exist
+    const response = await client.sendMessage(chatId, message);
+    console.log("Custom message sent successfully:", response.id._serialized);
+    return response;
+  } catch (error) {
+    console.error("Error sending custom message:", error);
+    
+    // If error is about undefined sendSeen or internal state, client might not be fully ready
+    if (error.message && (error.message.includes("sendSeen") || error.message.includes("Cannot read properties"))) {
+      console.error("Client internal state not ready, marking as not ready");
+      isReady = false;
+      throw new Error("WhatsApp client internal state not ready. Please try again in a few seconds.");
+    }
+    
+    throw error;
+  }
 }
 
 // Express setup
@@ -180,6 +239,8 @@ app.get("/health", (req, res) => {
   res.status(200).json({
     status: "ok",
     whatsappAuthenticated: isAuthenticated,
+    whatsappReady: isReady,
+    clientReady: isClientReady(),
   });
 });
 
@@ -187,6 +248,8 @@ app.get("/health", (req, res) => {
 app.get("/status", (req, res) => {
   res.status(200).json({
     whatsappAuthenticated: isAuthenticated,
+    whatsappReady: isReady,
+    clientReady: isClientReady(),
     timestamp: new Date().toISOString(),
   });
 });
@@ -205,7 +268,7 @@ app.post("/send-otp", async (req, res) => {
     });
   }
 
-  if (!isAuthenticated) {
+  if (!isClientReady()) {
     return res.status(503).json({
       success: false,
       message: "WhatsApp service not ready. Please wait for authentication.",
@@ -244,7 +307,7 @@ app.post("/send-message", async (req, res) => {
     });
   }
 
-  if (!isAuthenticated) {
+  if (!isClientReady()) {
     return res.status(503).json({
       success: false,
       message: "WhatsApp service not ready. Please wait for authentication.",
