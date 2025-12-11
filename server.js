@@ -410,49 +410,50 @@ function isClientReady() {
 
 function isInternalRaceError(error) {
   const msg = error?.message || "";
-  // The known failure signature you are seeing
   return msg.includes("sendSeen") || msg.includes("Cannot read properties of undefined");
 }
 
 async function ensureWarmBeforeSend() {
-  // Recompute readiness on-demand
   const { readyNow } = await recomputeReadiness();
-  if (!readyNow) {
-    throw new Error("WhatsApp client not ready");
-  }
+  if (!readyNow) throw new Error("WhatsApp client not ready");
 }
 
+/**
+ * Executes sendFn. If we hit the known WA-web injection race, warm again and retry once.
+ * This function ALWAYS either:
+ * - returns the sendFn result, or
+ * - throws an error after the retry attempt.
+ */
 async function sendWithOneRetry(sendFn) {
   try {
+    await ensureWarmBeforeSend();
     return await sendFn();
   } catch (error) {
     if (!isInternalRaceError(error)) throw error;
 
-    console.error(`[${nowIso()}] Internal state race detected; resetting warmup and retrying once.`);
+    console.error(`[${nowIso()}] Internal state race detected; warming and retrying once.`);
     resetWarmup("sendMessage-race");
     isReady = false;
 
-    // Give the runtime a moment to settle, then warm again
+    // small settle time
     await sleep(1500);
 
+    // try to warm; if warm fails, do one restart then warm again
     try {
       await ensureWarmBeforeSend();
-    } catch (_) {
-      // If we cannot become warm quickly, prefer restart rather than repeated failures
+    } catch (e) {
       await restartClient("send-race warmup failed");
       await ensureWarmBeforeSend();
     }
 
-    // Retry once
+    // retry once
     return await sendFn();
   }
 }
 
+
 async function sendOTP(phoneNumber, otp) {
-  if (!isClientReady()) {
-    console.error(`[${nowIso()}] Cannot send OTP: WhatsApp client not ready`);
-    throw new Error("WhatsApp client not ready");
-  }
+  if (!isAuthenticated) throw new Error("WhatsApp client not ready");
 
   const chatId = formatPhoneNumber(phoneNumber);
   const message = ` رمز التحقق هو : 
@@ -460,31 +461,24 @@ async function sendOTP(phoneNumber, otp) {
 
   console.log(`[${nowIso()}] Attempting to send OTP to ${chatId}`);
 
-  return await sendWithOneRetry(async () => {
-    // small jitter
+  return sendWithOneRetry(async () => {
     await sleep(250);
-    const response = await client.sendMessage(chatId, message);
-    console.log(`[${nowIso()}] OTP sent successfully:`, response?.id?._serialized || "ok");
-    return response;
+    return client.sendMessage(chatId, message);
   });
 }
 
 async function sendCustomMessage(phoneNumber, message) {
-  if (!isClientReady()) {
-    console.error(`[${nowIso()}] Cannot send message: WhatsApp client not ready`);
-    throw new Error("WhatsApp client not ready");
-  }
+  if (!isAuthenticated) throw new Error("WhatsApp client not ready");
 
   const chatId = formatPhoneNumber(phoneNumber);
   console.log(`[${nowIso()}] Attempting to send custom message to ${chatId}`);
 
-  return await sendWithOneRetry(async () => {
+  return sendWithOneRetry(async () => {
     await sleep(250);
-    const response = await client.sendMessage(chatId, message);
-    console.log(`[${nowIso()}] Custom message sent successfully:`, response?.id?._serialized || "ok");
-    return response;
+    return client.sendMessage(chatId, message);
   });
 }
+
 
 /* -------------------------------- Endpoints -------------------------------- */
 
