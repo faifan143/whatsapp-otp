@@ -1,6 +1,5 @@
 FROM node:18-bullseye-slim
 
-# Install Chromium with minimal dependencies
 RUN apt-get update && apt-get install -y \
     chromium \
     ca-certificates \
@@ -25,8 +24,8 @@ ENV NODE_ENV=production
 
 WORKDIR /app
 
-COPY package.json package-lock.json ./
-RUN npm ci --omit=dev
+COPY package.json ./
+RUN npm install --omit=dev
 
 COPY server.js .
 RUN mkdir -p .wwebjs_auth

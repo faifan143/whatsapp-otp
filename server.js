@@ -8,15 +8,12 @@ const port = process.env.PORT || 3002;
 
 app.use(express.json());
 
-// Config
 const AUTH_DIR = "./.wwebjs_auth";
 if (!fs.existsSync(AUTH_DIR)) fs.mkdirSync(AUTH_DIR, { recursive: true });
 
-// State
 let isAuthenticated = false;
 let isClientReady = false;
 
-// Simple WhatsApp client
 const client = new Client({
   authStrategy: new LocalAuth({ clientId: "default", dataPath: AUTH_DIR }),
   puppeteer: {
@@ -31,7 +28,6 @@ const client = new Client({
   },
 });
 
-// Events
 client.on("qr", (qr) => {
   console.log("[QR] Scan this QR code to authenticate:");
   qrcode.generate(qr, { small: true });
@@ -55,14 +51,12 @@ client.on("disconnected", async (reason) => {
   isClientReady = false;
 });
 
-// Helper: Format phone number
 function formatPhone(phone) {
   let num = phone.toString().replace(/[^0-9]/g, "");
   if (num.startsWith("0")) num = "963" + num.slice(1);
   return num + "@c.us";
 }
 
-// Helper: Send message with retries
 async function sendMessageWithRetry(chatId, text, maxRetries = 3) {
   for (let i = 0; i < maxRetries; i++) {
     try {
@@ -70,15 +64,13 @@ async function sendMessageWithRetry(chatId, text, maxRetries = 3) {
     } catch (err) {
       console.log(`[SEND] Attempt ${i + 1} failed: ${err.message}`);
       if (i < maxRetries - 1) {
-        await new Promise(r => setTimeout(r, 2000)); // wait 2s before retry
+        await new Promise(r => setTimeout(r, 2000));
       } else {
         throw err;
       }
     }
   }
 }
-
-// Endpoints
 
 app.get("/health", (req, res) => {
   res.json({
@@ -157,7 +149,6 @@ app.post("/send-message", async (req, res) => {
   }
 });
 
-// Start
 client.initialize();
 
 app.listen(port, "0.0.0.0", () => {
@@ -168,4 +159,4 @@ process.on("SIGINT", async () => {
   console.log("[SHUTDOWN] Closing...");
   await client.destroy();
   process.exit(0);
-}); 
+});
