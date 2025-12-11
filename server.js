@@ -105,13 +105,6 @@ client.on("qr", (qr) => {
   isReady = false;
 });
 
-// Authentication event
-client.on("authenticated", () => {
-  console.log("WhatsApp authentication successful!");
-  isAuthenticated = true;
-  isReady = false; // Not ready yet, wait for 'ready' event
-});
-
 // Auth failure event
 client.on("auth_failure", (msg) => {
   console.error("WhatsApp authentication failed:", msg);
@@ -124,6 +117,12 @@ client.on("ready", () => {
   console.log("WhatsApp Client is ready to send messages!");
   isAuthenticated = true;
   isReady = true;
+  
+  // Stop the fallback check interval if it's running
+  if (readyCheckInterval) {
+    clearInterval(readyCheckInterval);
+    readyCheckInterval = null;
+  }
 });
 
 // Disconnected event
@@ -131,6 +130,13 @@ client.on("disconnected", (reason) => {
   console.log("WhatsApp was disconnected:", reason);
   isAuthenticated = false;
   isReady = false;
+  
+  // Stop the fallback check interval
+  if (readyCheckInterval) {
+    clearInterval(readyCheckInterval);
+    readyCheckInterval = null;
+  }
+  
   // Attempt to reconnect
   setTimeout(() => {
     console.log("Attempting to reconnect...");
@@ -143,11 +149,62 @@ client.on("disconnected", (reason) => {
 // Loading screen event
 client.on("loading_screen", (percent, message) => {
   console.log(`Loading: ${percent}% - ${message}`);
+  
+  // If loading reaches 100%, try to mark as ready after a short delay
+  if (percent === 100) {
+    setTimeout(async () => {
+      try {
+        // Check if client info is available
+        if (client.info && client.info.wid) {
+          console.log("Loading complete, client appears ready");
+          isReady = true;
+        }
+      } catch (error) {
+        console.log("Waiting for ready event...");
+      }
+    }, 2000); // Wait 2 seconds after 100% to see if ready event fires
+  }
 });
 
 // Remote session saved event
 client.on("remote_session_saved", () => {
   console.log("Remote session saved successfully");
+});
+
+// Add a fallback: periodically check if client is ready even without ready event
+let readyCheckInterval = null;
+
+// Start checking for readiness after authentication
+client.on("authenticated", () => {
+  console.log("WhatsApp authentication successful!");
+  isAuthenticated = true;
+  isReady = false;
+  
+  // Start periodic check for readiness
+  if (readyCheckInterval) {
+    clearInterval(readyCheckInterval);
+  }
+  
+  readyCheckInterval = setInterval(() => {
+    if (isAuthenticated && !isReady) {
+      try {
+        if (client.info && client.info.wid) {
+          console.log("Client detected as ready (fallback check)");
+          isReady = true;
+          if (readyCheckInterval) {
+            clearInterval(readyCheckInterval);
+            readyCheckInterval = null;
+          }
+        }
+      } catch (error) {
+        // Client not ready yet, continue checking
+      }
+    } else if (isReady && readyCheckInterval) {
+      // Already ready, stop checking
+      clearInterval(readyCheckInterval);
+      readyCheckInterval = null;
+    }
+  }, 3000); // Check every 3 seconds
 });
 
 // Utility function to format phone number
