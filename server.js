@@ -7,11 +7,17 @@
  *   GET  /status
  *   POST /send-otp      { phoneNumber, otp, purpose } -> same response shape
  *   POST /send-message  { phoneNumber, message }      -> same response shape
- * - Make readiness deterministic (state-driven), observable, and self-healing.
- * - Avoid silent failures; add bounded logging.
- * - Add watchdog for "stuck at 99%" and recovery (restart client).
- * - VPS/headless-safe: prevent first-send race ("sendSeen undefined") via warmup + send queue.
+ * - Deterministic readiness:
+ *   - Authenticated + getState() == CONNECTED
+ *   - AND WhatsApp Web runtime injected (Store/WWebJS)
+ *   - AND warmup completed (presence call succeeds)
+ * - Self-healing:
+ *   - probe loop monitors state
+ *   - watchdog restarts on stuck loading / unstable runtime
+ * - Minimize noisy logs (rate-limited)
  */
+
+"use strict";
 
 const express = require("express");
 const { Client, LocalAuth } = require("whatsapp-web.js");
@@ -19,29 +25,27 @@ const qrcode = require("qrcode-terminal");
 const fs = require("fs");
 
 const app = express();
-const port = 3002;
+const port = process.env.PORT ? Number(process.env.PORT) : 3002;
 
 app.use(express.json());
 
 /* ------------------------------ Configuration ------------------------------ */
 
-const CLIENT_ID = "whatsapp-otp";
+const CLIENT_ID = process.env.WWEBJS_CLIENT_ID || "whatsapp-otp";
+const AUTH_DIR = process.env.WWEBJS_AUTH_DIR || "./.wwebjs_auth";
 
-// Watchdog / probe tuning
+// Probing / recovery
 const PROBE_INTERVAL_MS = 3000;
-const WATCHDOG_STUCK_MS = 120000; // 2 minutes at >=90% loading without CONNECTED -> restart
+const WATCHDOG_STUCK_MS = 120000; // 2 minutes at >=90% loading without stable ready -> restart
 const RESTART_BACKOFF_MS = 5000;
 
-// Warmup (VPS/headless)
-const WARMUP_TIMEOUT_MS = 15000;   // time budget to warm WhatsApp runtime
-const WARMUP_RETRY_MS = 500;       // retry delay for warmup attempts
-const POST_CONNECTED_GRACE_MS = 1500; // extra grace after CONNECTED before warmup (reduces flakiness)
+// Warmup / runtime gates
+const POST_CONNECTED_GRACE_MS = 2500; // give WA time after CONNECTED
+const WARMUP_TIMEOUT_MS = 25000;
+const WARMUP_RETRY_MS = 1200;
 
-// When true, we log additional details (still rate-limited)
+// Debug logging
 const DEBUG = process.env.DEBUG_WWEBJS === "1";
-
-// If you use Docker, prefer mounting this directory on the host (you already do)
-const AUTH_DIR = "./.wwebjs_auth";
 
 /* ------------------------------ Small utilities ---------------------------- */
 
@@ -76,56 +80,21 @@ function logEvery(key, ms, ...args) {
 
 try {
   if (!fs.existsSync(AUTH_DIR)) fs.mkdirSync(AUTH_DIR, { recursive: true });
-  // Do not wipe automatically in prod; it can force QR re-scan.
   console.log(`[${nowIso()}] Auth directory ensured: ${AUTH_DIR}`);
 } catch (error) {
   console.error(`[${nowIso()}] Error ensuring auth dir:`, safeErr(error));
 }
 
-/* -------------------- Chromium/Chrome executable resolver ------------------ */
-
-function resolveExecutablePath() {
-  if (process.env.PUPPETEER_EXECUTABLE_PATH) {
-    return process.env.PUPPETEER_EXECUTABLE_PATH;
-  }
-
-  const windowsCandidates = [
-    "C:\\\\Program Files\\\\Google\\\\Chrome\\\\Application\\\\chrome.exe",
-    "C:\\\\Program Files (x86)\\\\Google\\\\Chrome\\\\Application\\\\chrome.exe",
-    "C:\\\\Program Files\\\\Microsoft\\\\Edge\\\\Application\\\\msedge.exe",
-    "C:\\\\Program Files (x86)\\\\Microsoft\\\\Edge\\\\Application\\\\msedge.exe",
-  ];
-
-  const linuxCandidates = [
-    "/usr/bin/chromium-browser",
-    "/usr/bin/chromium",
-    "/usr/bin/google-chrome",
-    "/usr/bin/google-chrome-stable",
-    "/snap/bin/chromium",
-  ];
-
-  const candidates = process.platform === "win32" ? windowsCandidates : linuxCandidates;
-
-  for (const candidate of candidates) {
-    if (fs.existsSync(candidate)) {
-      console.log(`[${nowIso()}] Using detected browser executable: ${candidate}`);
-      return candidate;
-    }
-  }
-
-  console.warn(
-    `[${nowIso()}] No browser executable found in defaults; Puppeteer will use its own Chromium if available.`
-  );
-  return undefined;
-}
-
 /* ------------------------------ WhatsApp Client ---------------------------- */
-
+/**
+ * IMPORTANT:
+ * - On Linux VPS in Docker, prefer Puppeteer bundled Chromium (do not pass executablePath).
+ * - Keep --no-sandbox flags for containers.
+ */
 const client = new Client({
-  authStrategy: new LocalAuth({ clientId: CLIENT_ID }),
+  authStrategy: new LocalAuth({ clientId: CLIENT_ID, dataPath: AUTH_DIR }),
   puppeteer: {
     headless: true,
-    executablePath: resolveExecutablePath(),
     args: [
       "--no-sandbox",
       "--disable-setuid-sandbox",
@@ -135,7 +104,6 @@ const client = new Client({
       "--no-zygote",
       "--disable-gpu",
       "--disable-extensions",
-      "--disable-component-extensions-with-background-pages",
       "--disable-default-apps",
       "--mute-audio",
       "--hide-scrollbars",
@@ -147,37 +115,29 @@ const client = new Client({
 
 // Public flags (preserve semantics used by your endpoints)
 let isAuthenticated = false; // "session/auth succeeded"
-let isReady = false;         // "safe to send"
+let isReady = false;         // "safe to send" (strict gated)
 
-// Internal diagnostics / state
-let lastKnownState = null;   // from client.getState()
+// Internal diagnostics/state
+let lastKnownState = null;
 let lastStateAt = null;
 
 let loadingSince = null;
 let lastLoadingPercent = null;
 
 let probeTimer = null;
-
 let initializing = false;
 let restarting = false;
 
-// VPS/headless: prevent "CONNECTED but internal runtime not hydrated yet"
+// Warmup state
+let connectedSince = null;
 let warmupDone = false;
 let warmupInFlight = null;
-let connectedSince = null;
-
-// In-process send queue to avoid concurrent first-send races
-let sendLock = Promise.resolve();
-function withSendLock(fn) {
-  sendLock = sendLock.then(fn, fn);
-  return sendLock;
-}
 
 function resetWarmup(reason) {
-  if (DEBUG) console.log(`[${nowIso()}] [warmup] reset (${reason})`);
   warmupDone = false;
   warmupInFlight = null;
   connectedSince = null;
+  if (DEBUG) console.log(`[${nowIso()}] [warmup] reset (${reason})`);
 }
 
 async function getClientStateSafe() {
@@ -192,25 +152,44 @@ async function getClientStateSafe() {
   }
 }
 
-// Strict state definition of connected
 function stateIndicatesConnected(state) {
   return state === "CONNECTED";
 }
 
 /**
- * Warm-up gate (VPS/headless safe):
- * WhatsApp Web may report CONNECTED before internal modules are fully ready.
- * We "touch" the runtime via presence calls and wait a short grace period.
- * This avoids the common first-send failure: sendSeen undefined.
+ * Wait until WhatsApp Web runtime objects are present inside the page.
+ * This directly addresses the "sendSeen undefined" class of failures,
+ * which happens when Store is not injected/ready yet.
  */
+async function waitForWWebRuntime(timeoutMs = 20000) {
+  const page = client?.pupPage;
+  if (!page || typeof page.waitForFunction !== "function") {
+    // Best-effort: older/changed internals
+    return true;
+  }
+
+  try {
+    await page.waitForFunction(
+      () => {
+        // whatsapp-web.js injects helpers; Store is key for message pipeline.
+        return !!(window.Store && window.WWebJS);
+      },
+      { timeout: timeoutMs }
+    );
+    return true;
+  } catch (e) {
+    if (DEBUG) console.error(`[${nowIso()}] [warmup] waitForWWebRuntime timeout:`, safeErr(e));
+    return false;
+  }
+}
+
 async function warmupWhatsAppRuntime() {
   if (warmupDone) return true;
   if (!isAuthenticated) return false;
-
   if (warmupInFlight) return warmupInFlight;
 
   warmupInFlight = (async () => {
-    // Give WhatsApp Web a small grace period after CONNECTED
+    // Wait a bit after CONNECTED
     if (connectedSince) {
       const elapsed = Date.now() - connectedSince;
       if (elapsed < POST_CONNECTED_GRACE_MS) {
@@ -218,11 +197,13 @@ async function warmupWhatsAppRuntime() {
       }
     }
 
-    const deadline = Date.now() + WARMUP_TIMEOUT_MS;
+    const runtimeOk = await waitForWWebRuntime(20000);
+    if (!runtimeOk) return false;
 
+    const deadline = Date.now() + WARMUP_TIMEOUT_MS;
     while (Date.now() < deadline) {
       try {
-        // This touches the internal runtime; in the failure window it often throws.
+        // Presence call is a cheap way to confirm Store pipeline is usable.
         await client.sendPresenceAvailable();
         warmupDone = true;
         if (DEBUG) console.log(`[${nowIso()}] [warmup] runtime warmed successfully`);
@@ -232,7 +213,6 @@ async function warmupWhatsAppRuntime() {
         await sleep(WARMUP_RETRY_MS);
       }
     }
-
     return false;
   })();
 
@@ -245,29 +225,30 @@ async function recomputeReadiness() {
   const state = await getClientStateSafe();
   const connected = isAuthenticated && stateIndicatesConnected(state);
 
-  if (connected && !connectedSince) {
-    connectedSince = Date.now();
-  }
-  if (!connected) {
-    // if we drop from connected, warmup is no longer valid
-    resetWarmup("state-not-connected");
+  if (connected && !connectedSince) connectedSince = Date.now();
+
+  // Warmup must succeed to declare send-ready
+  let warmOk = false;
+  if (connected) {
+    warmOk = await warmupWhatsAppRuntime();
+  } else {
+    warmOk = false;
+    warmupDone = false;
   }
 
-  let readyNow = false;
-  if (connected) {
-    // Only become "ready" after warmup completes
-    readyNow = await warmupWhatsAppRuntime();
-  }
+  const readyNow = Boolean(connected && warmOk);
 
   if (readyNow && !isReady) {
     console.log(`[${nowIso()}] Client is fully send-ready (CONNECTED + warmed).`);
   }
   if (!readyNow && isReady) {
-    console.log(`[${nowIso()}] Client is no longer send-ready (state=${state}).`);
+    console.log(
+      `[${nowIso()}] Client is no longer send-ready (state=${state}, warmupDone=${warmupDone}).`
+    );
   }
 
   isReady = readyNow;
-  return { state, readyNow };
+  return { state, connected, warmOk, readyNow };
 }
 
 function startProbeLoop() {
@@ -276,7 +257,6 @@ function startProbeLoop() {
   probeTimer = setInterval(async () => {
     if (!isAuthenticated) return;
 
-    // 1) Recompute readiness based on getState() + warmup
     const { state, readyNow } = await recomputeReadiness();
 
     if (DEBUG) {
@@ -287,8 +267,8 @@ function startProbeLoop() {
       );
     }
 
-    // 2) Watchdog: if we are stuck at high loading for too long without CONNECTED, restart
-    if (!stateIndicatesConnected(state) && loadingSince && Date.now() - loadingSince > WATCHDOG_STUCK_MS) {
+    // Watchdog: stuck at high loading without stable ready
+    if (!readyNow && loadingSince && Date.now() - loadingSince > WATCHDOG_STUCK_MS) {
       const pct = lastLoadingPercent ?? "unknown";
       await restartClient(`loading stuck at ${pct}% for >${WATCHDOG_STUCK_MS / 1000}s`);
       loadingSince = null;
@@ -335,14 +315,11 @@ async function restartClient(reason) {
     console.error(`[${nowIso()}] [recovery] destroy() error:`, safeErr(e));
   }
 
-  // Small backoff to avoid tight crash loops
   await sleep(RESTART_BACKOFF_MS);
 
-  // Reset load tracking
   loadingSince = null;
   lastLoadingPercent = null;
 
-  // Re-init
   restarting = false;
   await initializeClientOnce();
 }
@@ -356,11 +333,9 @@ client.on("qr", (qr) => {
   isAuthenticated = false;
   isReady = false;
 
-  resetWarmup("qr");
-
-  // Reset diagnostics
   loadingSince = null;
   lastLoadingPercent = null;
+  resetWarmup("qr");
 });
 
 client.on("authenticated", () => {
@@ -369,8 +344,6 @@ client.on("authenticated", () => {
   isReady = false;
 
   resetWarmup("authenticated");
-
-  // Start probing readiness continuously (do not rely on "ready" event)
   startProbeLoop();
 });
 
@@ -383,9 +356,8 @@ client.on("auth_failure", (msg) => {
 });
 
 client.on("ready", async () => {
-  // Keep this as a helpful signal, but do not trust it alone.
+  // Helpful signal, but not trusted alone
   console.log(`[${nowIso()}] WhatsApp 'ready' event fired.`);
-  // Recompute using getState() + warmup to confirm send-readiness
   await recomputeReadiness();
 });
 
@@ -396,10 +368,8 @@ client.on("disconnected", async (reason) => {
   isReady = false;
 
   resetWarmup("disconnected");
-
   stopProbeLoop();
 
-  // Attempt recovery (single path)
   await restartClient(`disconnected: ${reason}`);
 });
 
@@ -438,96 +408,88 @@ function isClientReady() {
   return isAuthenticated && isReady;
 }
 
-function isInternalRaceError(err) {
-  const msg = err?.message || "";
-  return msg.includes("sendSeen") || msg.includes("Cannot read properties");
+function isInternalRaceError(error) {
+  const msg = error?.message || "";
+  // The known failure signature you are seeing
+  return msg.includes("sendSeen") || msg.includes("Cannot read properties of undefined");
 }
 
 async function ensureWarmBeforeSend() {
-  // Guard in case a request hits right at the moment CONNECTED flips.
-  if (!warmupDone) {
-    const ok = await warmupWhatsAppRuntime();
-    if (!ok) {
-      throw new Error("WhatsApp client internal state not ready. Please try again in a few seconds.");
+  // Recompute readiness on-demand
+  const { readyNow } = await recomputeReadiness();
+  if (!readyNow) {
+    throw new Error("WhatsApp client not ready");
+  }
+}
+
+async function sendWithOneRetry(sendFn) {
+  try {
+    return await sendFn();
+  } catch (error) {
+    if (!isInternalRaceError(error)) throw error;
+
+    console.error(`[${nowIso()}] Internal state race detected; resetting warmup and retrying once.`);
+    resetWarmup("sendMessage-race");
+    isReady = false;
+
+    // Give the runtime a moment to settle, then warm again
+    await sleep(1500);
+
+    try {
+      await ensureWarmBeforeSend();
+    } catch (_) {
+      // If we cannot become warm quickly, prefer restart rather than repeated failures
+      await restartClient("send-race warmup failed");
+      await ensureWarmBeforeSend();
     }
+
+    // Retry once
+    return await sendFn();
   }
 }
 
 async function sendOTP(phoneNumber, otp) {
-  return withSendLock(async () => {
-    if (!isClientReady()) {
-      console.error(`[${nowIso()}] Cannot send OTP: WhatsApp client not ready`);
-      throw new Error("WhatsApp client not ready");
-    }
+  if (!isClientReady()) {
+    console.error(`[${nowIso()}] Cannot send OTP: WhatsApp client not ready`);
+    throw new Error("WhatsApp client not ready");
+  }
 
-    await ensureWarmBeforeSend();
-
-    const chatId = formatPhoneNumber(phoneNumber);
-    const message = ` رمز التحقق هو : 
+  const chatId = formatPhoneNumber(phoneNumber);
+  const message = ` رمز التحقق هو : 
      ${otp}`;
 
-    console.log(`[${nowIso()}] Attempting to send OTP to ${chatId}`);
+  console.log(`[${nowIso()}] Attempting to send OTP to ${chatId}`);
 
-    try {
-      // Small jitter to reduce race conditions immediately after warmup
-      await sleep(300);
-
-      const response = await client.sendMessage(chatId, message);
-      console.log(`[${nowIso()}] OTP sent successfully:`, response?.id?._serialized || "ok");
-      return response;
-    } catch (error) {
-      console.error(`[${nowIso()}] Error sending OTP:`, safeErr(error));
-
-      if (isInternalRaceError(error)) {
-        console.error(`[${nowIso()}] Internal state race detected; resetting warmup and retry gate.`);
-        // Do not auto-resend here (avoid duplicates). Force re-warmup then caller retries.
-        isReady = false;
-        resetWarmup("sendOTP-race");
-        throw new Error("WhatsApp client internal state not ready. Please try again in a few seconds.");
-      }
-
-      throw error;
-    }
+  return await sendWithOneRetry(async () => {
+    // small jitter
+    await sleep(250);
+    const response = await client.sendMessage(chatId, message);
+    console.log(`[${nowIso()}] OTP sent successfully:`, response?.id?._serialized || "ok");
+    return response;
   });
 }
 
 async function sendCustomMessage(phoneNumber, message) {
-  return withSendLock(async () => {
-    if (!isClientReady()) {
-      console.error(`[${nowIso()}] Cannot send message: WhatsApp client not ready`);
-      throw new Error("WhatsApp client not ready");
-    }
+  if (!isClientReady()) {
+    console.error(`[${nowIso()}] Cannot send message: WhatsApp client not ready`);
+    throw new Error("WhatsApp client not ready");
+  }
 
-    await ensureWarmBeforeSend();
+  const chatId = formatPhoneNumber(phoneNumber);
+  console.log(`[${nowIso()}] Attempting to send custom message to ${chatId}`);
 
-    const chatId = formatPhoneNumber(phoneNumber);
-    console.log(`[${nowIso()}] Attempting to send custom message to ${chatId}`);
-
-    try {
-      await sleep(300);
-
-      const response = await client.sendMessage(chatId, message);
-      console.log(`[${nowIso()}] Custom message sent successfully:`, response?.id?._serialized || "ok");
-      return response;
-    } catch (error) {
-      console.error(`[${nowIso()}] Error sending custom message:`, safeErr(error));
-
-      if (isInternalRaceError(error)) {
-        console.error(`[${nowIso()}] Internal state race detected; resetting warmup and retry gate.`);
-        isReady = false;
-        resetWarmup("sendMessage-race");
-        throw new Error("WhatsApp client internal state not ready. Please try again in a few seconds.");
-      }
-
-      throw error;
-    }
+  return await sendWithOneRetry(async () => {
+    await sleep(250);
+    const response = await client.sendMessage(chatId, message);
+    console.log(`[${nowIso()}] Custom message sent successfully:`, response?.id?._serialized || "ok");
+    return response;
   });
 }
 
 /* -------------------------------- Endpoints -------------------------------- */
 
-// Health check endpoint (preserve keys; add optional diagnostics)
-app.get("/health", async (req, res) => {
+// Health check endpoint (preserve keys)
+app.get("/health", (req, res) => {
   res.status(200).json({
     status: "ok",
     whatsappAuthenticated: isAuthenticated,
@@ -536,7 +498,7 @@ app.get("/health", async (req, res) => {
   });
 });
 
-// Status endpoint (preserve keys; include timestamp)
+// Status endpoint (preserve keys + timestamp)
 app.get("/status", (req, res) => {
   res.status(200).json({
     whatsappAuthenticated: isAuthenticated,
@@ -630,10 +592,9 @@ app.post("/send-message", async (req, res) => {
 
 app.listen(port, "0.0.0.0", () => {
   console.log(`[${nowIso()}] Server is running on http://0.0.0.0:${port}`);
-  // Delay init slightly to ensure logs/IO are ready
   setTimeout(() => {
     initializeClientOnce();
-  }, 2000);
+  }, 1500);
 });
 
 process.on("SIGINT", async () => {
