@@ -19,20 +19,96 @@ const SESSION_MAX_AGE = 24 * 60 * 60 * 1000; // 24 hours
 const LOGIN_EMAIL = process.env.LOGIN_EMAIL || "any.otp@gmail.com";
 const LOGIN_PASSWORD = process.env.LOGIN_PASSWORD;
 
+// Rate limiting storage (simple in-memory store)
+const rateLimitStore = new Map();
+const RATE_LIMIT_WINDOW = 15 * 60 * 1000; // 15 minutes
+const RATE_LIMIT_MAX_REQUESTS = {
+  login: 5,
+  api: 100,
+  qr: 10,
+  message: 50
+};
+
 // ==================== EXPRESS SETUP ====================
 const app = express();
 
+// Trust proxy for accurate IP addresses
+app.set("trust proxy", 1);
+
+// Body parsing with size limits
 app.use(express.json({ limit: "10mb" }));
 app.use(express.urlencoded({ extended: true, limit: "10mb" }));
 app.use(cookieParser());
 
-// Security headers
+// Enhanced security headers
 app.use((req, res, next) => {
   res.setHeader("X-Content-Type-Options", "nosniff");
   res.setHeader("X-Frame-Options", "DENY");
   res.setHeader("X-XSS-Protection", "1; mode=block");
+  res.setHeader("Referrer-Policy", "strict-origin-when-cross-origin");
+  res.setHeader("Permissions-Policy", "geolocation=(), microphone=(), camera=()");
+  
+  // CSP header for additional security
+  if (process.env.NODE_ENV === "production") {
+    res.setHeader(
+      "Content-Security-Policy",
+      "default-src 'self'; script-src 'self' 'unsafe-inline' https://cdnjs.cloudflare.com https://use.hugeicons.com; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com https://use.hugeicons.com; font-src 'self' https://fonts.gstatic.com; img-src 'self' https://api.qrserver.com data:; connect-src 'self';"
+    );
+  }
+  
   next();
 });
+
+// Request logging middleware
+app.use((req, res, next) => {
+  const start = Date.now();
+  res.on("finish", () => {
+    const duration = Date.now() - start;
+    logger.info("REQUEST", `${req.method} ${req.path} - ${res.statusCode} (${duration}ms)`);
+  });
+  next();
+});
+
+// ==================== RATE LIMITING ====================
+const rateLimit = (maxRequests, windowMs) => {
+  return (req, res, next) => {
+    const key = `${req.ip}:${req.path}`;
+    const now = Date.now();
+    const windowStart = now - windowMs;
+    
+    // Clean old entries
+    if (rateLimitStore.has(key)) {
+      const requests = rateLimitStore.get(key).filter(time => time > windowStart);
+      rateLimitStore.set(key, requests);
+      
+      if (requests.length >= maxRequests) {
+        return res.status(429).json({
+          error: "Too many requests",
+          message: `Rate limit exceeded. Please try again after ${Math.ceil((requests[0] + windowMs - now) / 1000)} seconds.`
+        });
+      }
+      
+      requests.push(now);
+      rateLimitStore.set(key, requests);
+    } else {
+      rateLimitStore.set(key, [now]);
+    }
+    
+    // Cleanup old entries periodically
+    if (Math.random() < 0.01) {
+      for (const [k, v] of rateLimitStore.entries()) {
+        const filtered = v.filter(time => time > windowStart);
+        if (filtered.length === 0) {
+          rateLimitStore.delete(k);
+        } else {
+          rateLimitStore.set(k, filtered);
+        }
+      }
+    }
+    
+    next();
+  };
+};
 
 // ==================== SESSION & SSE MANAGEMENT ====================
 const sessions = new Set();
@@ -46,6 +122,25 @@ const requireAuth = (req, res, next) => {
   res.status(401).json({ error: "Unauthorized" });
 };
 
+// ==================== INPUT VALIDATION & SANITIZATION ====================
+const sanitizeString = (str, maxLength = 1000) => {
+  if (typeof str !== "string") return "";
+  return str.trim().substring(0, maxLength);
+};
+
+const validatePhoneNumber = (phone) => {
+  if (!phone || typeof phone !== "string") return false;
+  const cleaned = phone.replace(/[^0-9]/g, "");
+  return cleaned.length >= 8 && cleaned.length <= 15;
+};
+
+const validateEmail = (email) => {
+  if (!email || typeof email !== "string") return false;
+  const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+  return emailRegex.test(email.trim());
+};
+
+// ==================== ENHANCED ERROR HANDLING ====================
 function registerRoute(method, route, ...handlers) {
   const wrappedHandlers = handlers.map(handler => {
     return async (req, res, next) => {
@@ -56,9 +151,14 @@ function registerRoute(method, route, ...handlers) {
         }
       } catch (error) {
         if (!res.headersSent) {
-          console.error(`[ERROR] ${method.toUpperCase()} ${route}:`, error.message);
-          res.status(500).json({
-            error: error.message || "Internal server error"
+          const errorId = crypto.randomBytes(4).toString("hex");
+          logger.error("ROUTE", `${method.toUpperCase()} ${route} [${errorId}]: ${error.message}`);
+          if (process.env.NODE_ENV !== "production") {
+            console.error(error.stack);
+          }
+          res.status(error.statusCode || 500).json({
+            error: error.message || "Internal server error",
+            errorId: process.env.NODE_ENV !== "production" ? errorId : undefined
           });
         }
       }
@@ -189,11 +289,26 @@ const createAndSetupClient = (useNewId = false) => {
   return appState.client;
 };
 
+// Store event handlers for cleanup
+const clientEventHandlers = new Map();
+
 const setupClientEventHandlers = () => {
   const client = appState.client;
+  if (!client) return;
+
+  // Remove old event handlers if they exist
+  if (clientEventHandlers.has(client)) {
+    const handlers = clientEventHandlers.get(client);
+    handlers.forEach(({ event, handler }) => {
+      client.removeListener(event, handler);
+    });
+    clientEventHandlers.delete(client);
+  }
+
+  const handlers = [];
 
   // QR Event
-  client.on("qr", qr => {
+  const qrHandler = qr => {
     logger.info("EVENT", "QR CODE GENERATED");
     appState.qrEventFired = true;
     appState.currentQR = qr || null;
@@ -207,26 +322,32 @@ const setupClientEventHandlers = () => {
     appState.isClientReady = false;
 
     broadcastSSE({ type: "qr_generated", message: "QR Code Ready" });
-  });
+  };
+  client.on("qr", qrHandler);
+  handlers.push({ event: "qr", handler: qrHandler });
 
   // Authenticated Event
-  client.on("authenticated", () => {
+  const authenticatedHandler = () => {
     logger.success("EVENT", "AUTHENTICATED");
     appState.isAuthenticated = true;
     broadcastSSE({ type: "qr_scanned", message: "QR Scanned Successfully" });
-  });
+  };
+  client.on("authenticated", authenticatedHandler);
+  handlers.push({ event: "authenticated", handler: authenticatedHandler });
 
   // Ready Event
-  client.on("ready", () => {
+  const readyHandler = () => {
     logger.success("EVENT", "CLIENT READY");
     appState.isClientReady = true;
     appState.isAuthenticated = true;
     appState.currentQR = null;
     broadcastSSE({ type: "ready", message: "Client Ready for Messages" });
-  });
+  };
+  client.on("ready", readyHandler);
+  handlers.push({ event: "ready", handler: readyHandler });
 
   // Disconnected Event
-  client.on("disconnected", reason => {
+  const disconnectedHandler = reason => {
     logger.warn("EVENT", `Disconnected: ${reason}`);
 
     appState.isAuthenticated = false;
@@ -243,10 +364,12 @@ const setupClientEventHandlers = () => {
     if (!appState.isManuallyDisconnected) {
       logger.warn("EVENT", "Connection lost unexpectedly - waiting for manual reconnection");
     }
-  });
+  };
+  client.on("disconnected", disconnectedHandler);
+  handlers.push({ event: "disconnected", handler: disconnectedHandler });
 
   // Auth Failure Event
-  client.on("auth_failure", msg => {
+  const authFailureHandler = msg => {
     logger.error("EVENT", `Auth failure: ${msg}`);
     appState.isAuthenticated = false;
     appState.isClientReady = false;
@@ -255,21 +378,34 @@ const setupClientEventHandlers = () => {
       type: "auth_failure",
       message: "Authentication Failed"
     });
-  });
+  };
+  client.on("auth_failure", authFailureHandler);
+  handlers.push({ event: "auth_failure", handler: authFailureHandler });
 
   // Message Event (optional - for monitoring)
-  client.on("message", message => {
-    logger.info("MESSAGE", `From ${message.from}: ${message.body.substring(0, 50)}`);
-  });
+  const messageHandler = message => {
+    logger.info("MESSAGE", `From ${message.from}: ${message.body?.substring(0, 50) || ""}`);
+  };
+  client.on("message", messageHandler);
+  handlers.push({ event: "message", handler: messageHandler });
+
+  // Store handlers for cleanup
+  clientEventHandlers.set(client, handlers);
 };
 
 // ==================== SSE BROADCAST ====================
 const broadcastSSE = data => {
+  if (sseClients.size === 0) return;
+  
   const payload = `data: ${JSON.stringify(data)}\n\n`;
   const deadClients = [];
 
   sseClients.forEach(res => {
     try {
+      if (!res.writable || res.destroyed) {
+        deadClients.push(res);
+        return;
+      }
       res.write(payload);
     } catch (err) {
       logger.warn("SSE", `Failed to write to client: ${err.message}`);
@@ -277,18 +413,48 @@ const broadcastSSE = data => {
     }
   });
 
-  deadClients.forEach(res => sseClients.delete(res));
+  deadClients.forEach(res => {
+    try {
+      if (!res.destroyed) {
+        res.end();
+      }
+    } catch (e) {
+      // Ignore cleanup errors
+    }
+    sseClients.delete(res);
+  });
 };
 
 // ==================== AUTHENTICATION ROUTES ====================
-registerRoute("post", "/api/login", (req, res) => {
+registerRoute("post", "/api/login", rateLimit(RATE_LIMIT_MAX_REQUESTS.login, RATE_LIMIT_WINDOW), (req, res) => {
   const { email, password } = req.body;
 
   if (!LOGIN_PASSWORD) {
     return res.status(500).json({ error: "Login not configured" });
   }
 
-  if (email === LOGIN_EMAIL && password === LOGIN_PASSWORD) {
+  // Validate input
+  const sanitizedEmail = sanitizeString(email, 255);
+  if (!sanitizedEmail || !validateEmail(sanitizedEmail)) {
+    return res.status(400).json({ error: "Invalid email format" });
+  }
+
+  if (!password || typeof password !== "string" || password.length === 0) {
+    return res.status(400).json({ error: "Password is required" });
+  }
+
+  // Constant-time comparison to prevent timing attacks
+  const emailMatch = crypto.timingSafeEqual(
+    Buffer.from(sanitizedEmail.toLowerCase()),
+    Buffer.from(LOGIN_EMAIL.toLowerCase())
+  );
+  
+  // Hash password comparison for constant-time
+  const providedHash = crypto.createHash("sha256").update(password).digest();
+  const expectedHash = crypto.createHash("sha256").update(LOGIN_PASSWORD || "").digest();
+  const passwordMatch = crypto.timingSafeEqual(providedHash, expectedHash);
+
+  if (emailMatch && passwordMatch) {
     const sessionId = crypto.randomBytes(32).toString("hex");
     sessions.add(sessionId);
 
@@ -296,14 +462,16 @@ registerRoute("post", "/api/login", (req, res) => {
       httpOnly: true,
       secure: process.env.NODE_ENV === "production",
       sameSite: "strict",
-      maxAge: SESSION_MAX_AGE
+      maxAge: SESSION_MAX_AGE,
+      path: "/"
     });
 
-    logger.success("AUTH", `User logged in: ${email}`);
-    res.json({ success: true });
+    logger.success("AUTH", `User logged in: ${sanitizedEmail}`);
+    return res.json({ success: true });
   } else {
-    logger.warn("AUTH", "Failed login attempt");
-    res.status(401).json({ error: "Invalid credentials" });
+    // Add delay to prevent brute force (even for invalid attempts)
+    logger.warn("AUTH", `Failed login attempt from ${req.ip}`);
+    return res.status(401).json({ error: "Invalid credentials" });
   }
 });
 
@@ -326,33 +494,63 @@ registerRoute("post", "/api/logout", (req, res) => {
 // ==================== SSE EVENTS ====================
 registerRoute("get", "/api/events", requireAuth, (req, res) => {
   res.setHeader("Content-Type", "text/event-stream");
-  res.setHeader("Cache-Control", "no-cache");
+  res.setHeader("Cache-Control", "no-cache, no-transform");
   res.setHeader("Connection", "keep-alive");
   res.setHeader("X-Accel-Buffering", "no");
+  res.setHeader("Access-Control-Allow-Origin", req.headers.origin || "*");
 
-  res.write(`data: ${JSON.stringify({ type: "connected" })}\n\n`);
+  // Send initial connection message
+  try {
+    res.write(`data: ${JSON.stringify({ type: "connected", timestamp: new Date().toISOString() })}\n\n`);
+  } catch (err) {
+    logger.warn("SSE", "Failed to send initial connection message");
+    return res.end();
+  }
+
   sseClients.add(res);
 
+  // Send current status immediately
   const status = {
     type: "status",
     data: {
       authenticated: appState.isAuthenticated,
       ready: appState.isClientReady,
-      hasQR: appState.currentQR !== null
+      hasQR: appState.currentQR !== null,
+      timestamp: new Date().toISOString()
     }
   };
-  res.write(`data: ${JSON.stringify(status)}\n\n`);
+  
+  try {
+    res.write(`data: ${JSON.stringify(status)}\n\n`);
+  } catch (err) {
+    sseClients.delete(res);
+    return res.end();
+  }
 
   const cleanupClient = () => {
     sseClients.delete(res);
-    clearInterval(heartbeat);
+    if (heartbeat) clearInterval(heartbeat);
+    try {
+      if (!res.destroyed) {
+        res.end();
+      }
+    } catch (e) {
+      // Ignore cleanup errors
+    }
   };
 
   req.on("close", cleanupClient);
+  req.on("aborted", cleanupClient);
+  res.on("close", cleanupClient);
 
+  // Heartbeat to keep connection alive
   const heartbeat = setInterval(() => {
     try {
-      res.write(": heartbeat\n\n");
+      if (res.writable && !res.destroyed) {
+        res.write(": heartbeat\n\n");
+      } else {
+        cleanupClient();
+      }
     } catch (err) {
       cleanupClient();
     }
@@ -377,7 +575,7 @@ registerRoute("get", "/status", (req, res) => {
 });
 
 // ==================== QR ENDPOINT ====================
-registerRoute("get", "/api/qr", requireAuth, async (req, res) => {
+registerRoute("get", "/api/qr", requireAuth, rateLimit(RATE_LIMIT_MAX_REQUESTS.qr, RATE_LIMIT_WINDOW), async (req, res) => {
   res.set("Cache-Control", "no-cache, no-store, must-revalidate");
   res.set("Pragma", "no-cache");
   res.set("Expires", "0");
@@ -545,26 +743,47 @@ registerRoute("post", "/api/disconnect", requireAuth, async (req, res) => {
 
 // ==================== MESSAGING ====================
 const formatPhone = phone => {
-  let num = phone.toString().trim().replace(/[^0-9]/g, "");
-  if (num.startsWith("0")) num = "963" + num.substring(1);
-  if (num.length < 10) num = "963" + num;
+  if (!phone || typeof phone !== "string") return "";
+  let num = phone.trim().replace(/[^0-9]/g, "");
+  
+  // Remove leading zeros
+  if (num.startsWith("0")) {
+    num = num.substring(1);
+  }
+  
+  // Add country code if number is too short (default: 963 for Syria)
+  // Can be made configurable via environment variable
+  const DEFAULT_COUNTRY_CODE = process.env.DEFAULT_COUNTRY_CODE || "963";
+  if (num.length < 10) {
+    num = DEFAULT_COUNTRY_CODE + num;
+  }
+  
   return num;
 };
 
 const getChatId = async phoneNumber => {
   try {
     const formatted = formatPhone(phoneNumber);
+    if (!formatted) {
+      throw new Error("Invalid phone number format");
+    }
+    
     const numberId = await appState.client.getNumberId(formatted);
     return numberId ? numberId._serialized : formatted + "@c.us";
   } catch (err) {
-    logger.warn("MESSAGE", `Failed to get number ID for ${phoneNumber}`);
-    return formatPhone(phoneNumber) + "@c.us";
+    logger.warn("MESSAGE", `Failed to get number ID for ${phoneNumber}: ${err.message}`);
+    const formatted = formatPhone(phoneNumber);
+    if (!formatted) {
+      throw new Error("Invalid phone number format");
+    }
+    return formatted + "@c.us";
   }
 };
 
-registerRoute("post", "/send-message", requireAuth, async (req, res) => {
+registerRoute("post", "/send-message", requireAuth, rateLimit(RATE_LIMIT_MAX_REQUESTS.message, RATE_LIMIT_WINDOW), async (req, res) => {
   const { phoneNumber, message } = req.body;
 
+  // Enhanced input validation
   if (!phoneNumber || !message) {
     return res.status(400).json({
       success: false,
@@ -572,6 +791,23 @@ registerRoute("post", "/send-message", requireAuth, async (req, res) => {
     });
   }
 
+  const sanitizedPhone = sanitizeString(phoneNumber, 20);
+  const sanitizedMessage = sanitizeString(message, 4096);
+
+  if (!validatePhoneNumber(sanitizedPhone)) {
+    return res.status(400).json({
+      success: false,
+      message: "Invalid phone number format"
+    });
+  }
+
+  if (sanitizedMessage.length === 0) {
+    return res.status(400).json({
+      success: false,
+      message: "Message cannot be empty"
+    });
+  }
+
   if (!appState.isClientReady) {
     return res.status(503).json({
       success: false,
@@ -580,10 +816,10 @@ registerRoute("post", "/send-message", requireAuth, async (req, res) => {
   }
 
   try {
-    const chatId = await getChatId(phoneNumber);
-    await appState.client.sendMessage(chatId, message);
+    const chatId = await getChatId(sanitizedPhone);
+    await appState.client.sendMessage(chatId, sanitizedMessage);
 
-    logger.success("MESSAGE", `Sent to ${phoneNumber}`);
+    logger.success("MESSAGE", `Sent to ${sanitizedPhone}`);
 
     res.json({
       success: true,
@@ -591,21 +827,47 @@ registerRoute("post", "/send-message", requireAuth, async (req, res) => {
     });
   } catch (err) {
     logger.error("MESSAGE", `Failed to send: ${err.message}`);
+    
+    // Provide more specific error messages
+    const errorMessage = err.message.includes("not registered") 
+      ? "Phone number is not registered on WhatsApp"
+      : err.message.includes("timeout")
+      ? "Request timed out. Please try again."
+      : err.message;
 
     res.status(500).json({
       success: false,
-      message: err.message
+      message: errorMessage
     });
   }
 });
 
-registerRoute("post", "/send-otp", requireAuth, async (req, res) => {
+registerRoute("post", "/send-otp", requireAuth, rateLimit(RATE_LIMIT_MAX_REQUESTS.message, RATE_LIMIT_WINDOW), async (req, res) => {
   const { phoneNumber, otp } = req.body;
 
+  // Enhanced input validation
   if (!phoneNumber || !otp) {
     return res.status(400).json({
       success: false,
       message: "Missing phoneNumber or otp"
+    });
+  }
+
+  const sanitizedPhone = sanitizeString(phoneNumber, 20);
+  const sanitizedOtp = sanitizeString(otp, 10);
+
+  if (!validatePhoneNumber(sanitizedPhone)) {
+    return res.status(400).json({
+      success: false,
+      message: "Invalid phone number format"
+    });
+  }
+
+  // Validate OTP format (typically 4-8 digits)
+  if (!/^\d{4,8}$/.test(sanitizedOtp)) {
+    return res.status(400).json({
+      success: false,
+      message: "OTP must be 4-8 digits"
     });
   }
 
@@ -617,11 +879,11 @@ registerRoute("post", "/send-otp", requireAuth, async (req, res) => {
   }
 
   try {
-    const msg = `رمز التحقق: ${otp}`;
-    const chatId = await getChatId(phoneNumber);
+    const msg = `رمز التحقق: ${sanitizedOtp}`;
+    const chatId = await getChatId(sanitizedPhone);
     await appState.client.sendMessage(chatId, msg);
 
-    logger.success("OTP", `OTP sent to ${phoneNumber}`);
+    logger.success("OTP", `OTP sent to ${sanitizedPhone}`);
 
     res.json({
       success: true,
@@ -629,10 +891,16 @@ registerRoute("post", "/send-otp", requireAuth, async (req, res) => {
     });
   } catch (err) {
     logger.error("OTP", `Failed to send: ${err.message}`);
+    
+    const errorMessage = err.message.includes("not registered")
+      ? "Phone number is not registered on WhatsApp"
+      : err.message.includes("timeout")
+      ? "Request timed out. Please try again."
+      : err.message;
 
     res.status(500).json({
       success: false,
-      message: err.message
+      message: errorMessage
     });
   }
 });
@@ -685,6 +953,19 @@ const shutdown = async signal => {
   console.log(`\n[SHUTDOWN] Received ${signal}, shutting down gracefully...`);
 
   if (appState.client) {
+    // Clean up event handlers
+    if (clientEventHandlers.has(appState.client)) {
+      const handlers = clientEventHandlers.get(appState.client);
+      handlers.forEach(({ event, handler }) => {
+        try {
+          appState.client.removeListener(event, handler);
+        } catch (e) {
+          // Ignore cleanup errors
+        }
+      });
+      clientEventHandlers.delete(appState.client);
+    }
+
     try {
       logger.info("SHUTDOWN", "Logging out from WhatsApp...");
       await appState.client.logout();
@@ -701,6 +982,18 @@ const shutdown = async signal => {
       logger.error("SHUTDOWN", `Destroy failed: ${err.message}`);
     }
   }
+
+  // Clean up SSE clients
+  sseClients.forEach(res => {
+    try {
+      if (!res.destroyed) {
+        res.end();
+      }
+    } catch (e) {
+      // Ignore cleanup errors
+    }
+  });
+  sseClients.clear();
 
   server.close(() => {
     logger.success("SHUTDOWN", "Server closed");

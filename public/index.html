@@ -297,9 +297,15 @@
             min-height: 250px;
         }
 
-        #qrCode canvas {
+        #qrCode canvas,
+        #qrCode img {
             max-width: 100%;
             height: auto;
+            display: block;
+        }
+        
+        #qrCode img {
+            border-radius: 6px;
         }
 
         .qr-instruction {
@@ -720,13 +726,31 @@
             <div class="card-header"><i class="hgi hgi-send-01"></i> Send Message</div>
             
             <div class="form-group">
-                <label class="form-label"><i class="hgi hgi-phone"></i> Phone Number</label>
-                <input type="text" id="phoneNumber" placeholder="+1 (555) 123-4567 or local format" />
+                <label class="form-label" for="phoneNumber"><i class="hgi hgi-phone"></i> Phone Number</label>
+                <input 
+                    type="tel" 
+                    id="phoneNumber" 
+                    name="phoneNumber"
+                    placeholder="+1 (555) 123-4567 or local format" 
+                    autocomplete="tel"
+                    aria-required="true"
+                    aria-label="Phone number"
+                />
             </div>
 
             <div class="form-group">
-                <label class="form-label"><i class="hgi hgi-message-circle-01"></i> Message</label>
-                <textarea id="message" placeholder="Enter your message...">Test message from WhatsApp OTP Service</textarea>
+                <label class="form-label" for="message"><i class="hgi hgi-message-circle-01"></i> Message</label>
+                <textarea 
+                    id="message" 
+                    name="message"
+                    placeholder="Enter your message..." 
+                    aria-required="true"
+                    aria-label="Message content"
+                    maxlength="4096"
+                >Test message from WhatsApp OTP Service</textarea>
+                <small style="display: block; margin-top: 4px; color: var(--text-tertiary); font-size: 12px;">
+                    <span id="charCount">0</span>/4096 characters
+                </small>
             </div>
 
             <div class="button-group">
@@ -764,18 +788,82 @@
     <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcode.js/1.5.3/qrcode.min.js"></script>
     <script>
         const API_BASE = '';
-        let statusInterval;
-        let isAuthenticated = false;
-        let eventSource = null;
+        
+        // ==================== STATE MANAGEMENT ====================
+        const AppState = {
+            statusInterval: null,
+            isAuthenticated: false,
+            eventSource: null,
+            qrCheckTimeout: null,
+            lastQrCheck: 0,
+            isOnline: navigator.onLine,
+            reconnectAttempts: 0,
+            maxReconnectAttempts: 5
+        };
+
+        // ==================== UTILITY FUNCTIONS ====================
+        const debounce = (func, wait) => {
+            let timeout;
+            return function executedFunction(...args) {
+                const later = () => {
+                    clearTimeout(timeout);
+                    func(...args);
+                };
+                clearTimeout(timeout);
+                timeout = setTimeout(later, wait);
+            };
+        };
+
+        const throttle = (func, limit) => {
+            let inThrottle;
+            return function(...args) {
+                if (!inThrottle) {
+                    func.apply(this, args);
+                    inThrottle = true;
+                    setTimeout(() => inThrottle = false, limit);
+                }
+            };
+        };
+
+        // Online/Offline detection
+        window.addEventListener('online', () => {
+            AppState.isOnline = true;
+            AppState.reconnectAttempts = 0;
+            if (AppState.isAuthenticated) {
+                showAlert('Connection restored', 'success');
+                startStatusCheck();
+                if (!AppState.eventSource) {
+                    startEventStream();
+                }
+            }
+        });
+
+        window.addEventListener('offline', () => {
+            AppState.isOnline = false;
+            showAlert('Connection lost. Please check your internet connection.', 'error');
+        });
 
         // Check authentication status on load
         async function checkAuth() {
+            if (!AppState.isOnline) {
+                showAlert('No internet connection', 'error');
+                return;
+            }
+
             try {
-                const res = await fetch('/otp-service/api/auth/check');
-                const data = await res.json();
-                isAuthenticated = data.authenticated;
+                const controller = new AbortController();
+                const timeoutId = setTimeout(() => controller.abort(), 5000);
                 
-                if (isAuthenticated) {
+                const res = await fetch('/otp-service/api/auth/check', {
+                    signal: controller.signal,
+                    credentials: 'include'
+                });
+                
+                clearTimeout(timeoutId);
+                const data = await res.json();
+                AppState.isAuthenticated = data.authenticated;
+                
+                if (AppState.isAuthenticated) {
                     document.getElementById('loginContainer').classList.add('hidden');
                     document.getElementById('mainContent').classList.remove('hidden');
                     startStatusCheck();
@@ -787,6 +875,11 @@
                     stopEventStream();
                 }
             } catch (error) {
+                if (error.name === 'AbortError') {
+                    showAlert('Request timeout. Please check your connection.', 'error');
+                } else {
+                    console.error('Auth check error:', error);
+                }
                 document.getElementById('loginContainer').classList.remove('hidden');
                 document.getElementById('mainContent').classList.add('hidden');
                 stopEventStream();
@@ -795,17 +888,25 @@
 
         // Start Server-Sent Events stream for real-time updates
         function startEventStream() {
-            if (eventSource) {
+            if (AppState.eventSource) {
                 return; // Already connected
             }
 
-            eventSource = new EventSource('/otp-service/api/events');
+            if (!AppState.isOnline) {
+                return;
+            }
 
-            eventSource.onopen = () => {
-                // Connected
-            };
+            try {
+                AppState.eventSource = new EventSource('/otp-service/api/events', {
+                    withCredentials: true
+                });
 
-            eventSource.onmessage = (event) => {
+                AppState.eventSource.onopen = () => {
+                    AppState.reconnectAttempts = 0;
+                    // Connected
+                };
+
+                AppState.eventSource.onmessage = (event) => {
                 try {
                     const data = JSON.parse(event.data);
 
@@ -851,22 +952,36 @@
                 }
             };
 
-            eventSource.onerror = (error) => {
-                // Try to restart event stream after 3 seconds
-                setTimeout(() => {
-                    if (eventSource && eventSource.readyState === EventSource.CLOSED) {
+                AppState.eventSource.onerror = (error) => {
+                    if (AppState.eventSource && AppState.eventSource.readyState === EventSource.CLOSED) {
                         stopEventStream();
-                        startEventStream();
+                        
+                        // Exponential backoff for reconnection
+                        if (AppState.reconnectAttempts < AppState.maxReconnectAttempts && AppState.isOnline) {
+                            const delay = Math.min(1000 * Math.pow(2, AppState.reconnectAttempts), 30000);
+                            AppState.reconnectAttempts++;
+                            setTimeout(() => {
+                                if (AppState.isAuthenticated && AppState.isOnline) {
+                                    startEventStream();
+                                }
+                            }, delay);
+                        }
                     }
-                }, 3000);
-            };
+                };
+            } catch (error) {
+                console.error('Failed to create EventSource:', error);
+            }
         }
 
         // Stop event stream
         function stopEventStream() {
-            if (eventSource) {
-                eventSource.close();
-                eventSource = null;
+            if (AppState.eventSource) {
+                try {
+                    AppState.eventSource.close();
+                } catch (e) {
+                    // Ignore errors on close
+                }
+                AppState.eventSource = null;
             }
         }
 
@@ -913,32 +1028,59 @@
         // Logout handler
         document.getElementById('logoutBtn').addEventListener('click', async () => {
             try {
-                await fetch('/otp-service/api/logout', { method: 'POST' });
-                isAuthenticated = false;
-                if (statusInterval) clearInterval(statusInterval);
+                const controller = new AbortController();
+                const timeoutId = setTimeout(() => controller.abort(), 5000);
+                
+                await fetch('/otp-service/api/logout', {
+                    method: 'POST',
+                    signal: controller.signal,
+                    credentials: 'include'
+                });
+                
+                clearTimeout(timeoutId);
+                AppState.isAuthenticated = false;
+                if (AppState.statusInterval) clearInterval(AppState.statusInterval);
                 stopEventStream();
                 checkAuth();
             } catch (error) {
-                // Logout error
+                if (error.name !== 'AbortError') {
+                    console.error('Logout error:', error);
+                }
             }
         });
 
         function startStatusCheck() {
             checkStatus();
-            statusInterval = setInterval(checkStatus, 2000);
+            // Throttled status check to reduce server load
+            AppState.statusInterval = setInterval(throttle(checkStatus, 2000), 2000);
         }
 
         async function checkStatus() {
-            if (!isAuthenticated) return;
+            if (!AppState.isAuthenticated || !AppState.isOnline) return;
+            
             try {
-                const res = await fetch('/otp-service/status');
+                const controller = new AbortController();
+                const timeoutId = setTimeout(() => controller.abort(), 5000);
+                
+                const res = await fetch('/otp-service/status', {
+                    signal: controller.signal,
+                    credentials: 'include'
+                });
+                
+                clearTimeout(timeoutId);
+                
+                if (!res.ok) {
+                    throw new Error(`HTTP ${res.status}`);
+                }
+                
                 const data = await res.json();
                 
                 // Update UI based on server state
                 updateStatusElement('statusReady', data.ready);
                 updateStatusElement('statusAuth', data.authenticated);
                 
-                document.getElementById('lastUpdate').innerHTML = `<i class="hgi hgi-clock status-icon"></i><span>${new Date(data.timestamp).toLocaleTimeString()}</span>`;
+                const timeStr = new Date(data.timestamp).toLocaleTimeString();
+                document.getElementById('lastUpdate').innerHTML = `<i class="hgi hgi-clock status-icon"></i><span>${timeStr}</span>`;
                 
                 // Manage button visibility based on ready state
                 if (data.ready) {
@@ -946,11 +1088,15 @@
                     document.getElementById('qrContainer').classList.add('hidden');
                     document.getElementById('disconnectBtn').classList.remove('hidden');
                 } else {
-                    // Not ready, show QR if available
-                    checkQrCode();
+                    // Not ready, show QR if available (debounced)
+                    debouncedCheckQrCode();
                 }
             } catch (error) {
-                // Status error
+                if (error.name === 'AbortError') {
+                    // Timeout - don't spam errors
+                    return;
+                }
+                console.error('Status check error:', error);
             }
         }
 
@@ -981,16 +1127,52 @@
             }
         }
 
+        // Debounced QR check to prevent excessive requests
+        const debouncedCheckQrCode = debounce(async () => {
+            await checkQrCode();
+        }, 1000);
+
         async function checkQrCode() {
+            if (!AppState.isAuthenticated || !AppState.isOnline) return;
+            
+            // Prevent checking too frequently
+            const now = Date.now();
+            if (now - AppState.lastQrCheck < 2000) {
+                return;
+            }
+            AppState.lastQrCheck = now;
+
             try {
-                const res = await fetch('/otp-service/api/qr');
+                const controller = new AbortController();
+                const timeoutId = setTimeout(() => controller.abort(), 30000); // 30s timeout for QR
+                
+                const res = await fetch('/otp-service/api/qr', {
+                    signal: controller.signal,
+                    credentials: 'include'
+                });
+                
+                clearTimeout(timeoutId);
+                
+                if (!res.ok) {
+                    throw new Error(`HTTP ${res.status}`);
+                }
+                
                 const data = await res.json();
                 
                 if (data && data.qr) {
                     displayQRCode(data.qr);
+                } else if (data.ready) {
+                    // Client is ready, hide QR
+                    document.getElementById('qrContainer').classList.add('hidden');
+                } else if (data.timeout) {
+                    showAlert('QR code generation timed out. Please try again.', 'error');
                 }
             } catch (error) {
-                // QR fetch error
+                if (error.name === 'AbortError') {
+                    showAlert('QR code request timed out', 'error');
+                } else {
+                    console.error('QR check error:', error);
+                }
             }
         }
 
@@ -1032,8 +1214,27 @@
         }
 
         async function disconnect() {
+            if (!AppState.isOnline) {
+                showAlert('No internet connection', 'error');
+                return;
+            }
+
             try {
-                const res = await fetch('/otp-service/api/disconnect', { method: 'POST' });
+                const controller = new AbortController();
+                const timeoutId = setTimeout(() => controller.abort(), 30000); // 30s timeout
+                
+                const res = await fetch('/otp-service/api/disconnect', {
+                    method: 'POST',
+                    signal: controller.signal,
+                    credentials: 'include'
+                });
+                
+                clearTimeout(timeoutId);
+                
+                if (!res.ok) {
+                    throw new Error(`HTTP ${res.status}`);
+                }
+                
                 const data = await res.json();
                 
                 if (data.success) {
@@ -1061,10 +1262,14 @@
                     // Step 5: Show success message
                     showAlert(data.message || 'Completely disconnected.', 'success');
                 } else {
-                    showAlert('Failed: ' + data.message, 'error');
+                    showAlert('Failed: ' + (data.message || 'Unknown error'), 'error');
                 }
             } catch (error) {
-                showAlert('Error: ' + error.message, 'error');
+                if (error.name === 'AbortError') {
+                    showAlert('Disconnect request timed out. Please try again.', 'error');
+                } else {
+                    showAlert('Error: ' + (error.message || 'Unknown error'), 'error');
+                }
             }
         }
 
@@ -1083,11 +1288,31 @@
         }
 
         async function sendTestMessage() {
+            if (!AppState.isOnline) {
+                showAlert('No internet connection', 'error');
+                return;
+            }
+
             const phoneNumber = document.getElementById('phoneNumber').value.trim();
             const message = document.getElementById('message').value.trim();
 
             if (!phoneNumber) {
                 showAlert('Please enter a phone number', 'error');
+                document.getElementById('phoneNumber').focus();
+                return;
+            }
+
+            if (!message) {
+                showAlert('Please enter a message', 'error');
+                document.getElementById('message').focus();
+                return;
+            }
+
+            // Basic phone number validation
+            const phoneRegex = /^[\d\s\-\+\(\)]+$/;
+            if (!phoneRegex.test(phoneNumber)) {
+                showAlert('Invalid phone number format', 'error');
+                document.getElementById('phoneNumber').focus();
                 return;
             }
 
@@ -1097,22 +1322,38 @@
             btn.innerHTML = '<i class="hgi hgi-loading-01"></i><span>Sending</span>';
 
             try {
+                const controller = new AbortController();
+                const timeoutId = setTimeout(() => controller.abort(), 60000); // 60s timeout for sending
+                
                 const res = await fetch('/otp-service/send-message', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ phoneNumber, message })
+                    body: JSON.stringify({ phoneNumber, message }),
+                    signal: controller.signal,
+                    credentials: 'include'
                 });
+                
+                clearTimeout(timeoutId);
+                
+                if (!res.ok) {
+                    throw new Error(`HTTP ${res.status}`);
+                }
 
                 const data = await res.json();
 
                 if (data.success) {
                     showAlert('Message sent successfully!', 'success');
                     document.getElementById('phoneNumber').value = '';
+                    // Keep message for convenience but clear phone number
                 } else {
-                    showAlert('Failed: ' + data.message, 'error');
+                    showAlert('Failed: ' + (data.message || 'Unknown error'), 'error');
                 }
             } catch (error) {
-                showAlert('Error: ' + error.message, 'error');
+                if (error.name === 'AbortError') {
+                    showAlert('Request timed out. Please try again.', 'error');
+                } else {
+                    showAlert('Error: ' + (error.message || 'Unknown error'), 'error');
+                }
             } finally {
                 btn.disabled = false;
                 btn.innerHTML = originalHTML;
@@ -1121,10 +1362,51 @@
 
         function showAlert(message, type) {
             const alertEl = document.getElementById('alert');
-            const iconMap = { success: 'hgi-check-circle-02', error: 'hgi-alert-circle' };
-            alertEl.innerHTML = `<span class="alert-icon"><i class="hgi ${iconMap[type]}"></i></span><span>${message}</span>`;
+            if (!alertEl) return;
+            
+            const iconMap = { 
+                success: 'hgi-check-circle-02', 
+                error: 'hgi-alert-circle',
+                warning: 'hgi-alert-triangle'
+            };
+            
+            // Escape HTML to prevent XSS
+            const escapedMessage = message
+                .replace(/&/g, '&amp;')
+                .replace(/</g, '&lt;')
+                .replace(/>/g, '&gt;')
+                .replace(/"/g, '&quot;')
+                .replace(/'/g, '&#039;');
+            
+            alertEl.innerHTML = `<span class="alert-icon"><i class="hgi ${iconMap[type] || iconMap.error}"></i></span><span>${escapedMessage}</span>`;
             alertEl.className = `alert show alert-${type}`;
-            setTimeout(() => alertEl.classList.remove('show'), 4000);
+            
+            // Auto-hide after 5 seconds (longer for errors)
+            const hideDelay = type === 'error' ? 6000 : 4000;
+            setTimeout(() => {
+                if (alertEl) {
+                    alertEl.classList.remove('show');
+                }
+            }, hideDelay);
+        }
+
+        // Character counter for message textarea
+        const messageTextarea = document.getElementById('message');
+        const charCountEl = document.getElementById('charCount');
+        if (messageTextarea && charCountEl) {
+            const updateCharCount = () => {
+                const length = messageTextarea.value.length;
+                charCountEl.textContent = length;
+                if (length > 4000) {
+                    charCountEl.style.color = 'var(--error)';
+                } else if (length > 3500) {
+                    charCountEl.style.color = 'var(--warning)';
+                } else {
+                    charCountEl.style.color = 'var(--text-tertiary)';
+                }
+            };
+            messageTextarea.addEventListener('input', updateCharCount);
+            updateCharCount(); // Initial count
         }
 
         // Single initialization point
@@ -1148,6 +1430,24 @@
             });
 
             checkAuth();
+            
+            // Periodic auth check (every 5 minutes) to handle session expiration
+            setInterval(() => {
+                if (AppState.isAuthenticated && AppState.isOnline) {
+                    checkAuth();
+                }
+            }, 5 * 60 * 1000);
+        });
+
+        // Cleanup on page unload
+        window.addEventListener('beforeunload', () => {
+            stopEventStream();
+            if (AppState.statusInterval) {
+                clearInterval(AppState.statusInterval);
+            }
+            if (AppState.qrCheckTimeout) {
+                clearTimeout(AppState.qrCheckTimeout);
+            }
         });
     </script>
 </body>
