@@ -106,14 +106,32 @@ else
     echo -e "${GREEN}PM2 version: $(pm2 -v)${NC}"
 fi
 
-echo -e "${YELLOW}Step 6: Installing project dependencies...${NC}"
+echo -e "${YELLOW}Step 6: Cleaning git repository and pulling latest changes...${NC}"
 cd "$(dirname "$0")"
+
+# Check if this is a git repository
+if [ -d .git ]; then
+    echo -e "${YELLOW}Discarding all local changes to tracked files...${NC}"
+    git reset --hard HEAD || echo -e "${YELLOW}Warning: git reset failed (may not be a git repo)${NC}"
+    
+    echo -e "${YELLOW}Removing untracked files and directories...${NC}"
+    git clean -fd || echo -e "${YELLOW}Warning: git clean failed${NC}"
+    
+    echo -e "${YELLOW}Pulling latest changes from repository...${NC}"
+    git pull || echo -e "${YELLOW}Warning: git pull failed (may not have remote configured)${NC}"
+    
+    echo -e "${GREEN}Repository cleaned and updated${NC}"
+else
+    echo -e "${YELLOW}Not a git repository, skipping git cleanup${NC}"
+fi
+
+echo -e "${YELLOW}Step 7: Installing project dependencies...${NC}"
 npm install --production
 
-echo -e "${YELLOW}Step 7: Creating logs directory...${NC}"
+echo -e "${YELLOW}Step 8: Creating logs directory...${NC}"
 mkdir -p logs
 
-echo -e "${YELLOW}Step 8: Setting up PM2 startup script...${NC}"
+echo -e "${YELLOW}Step 9: Setting up PM2 startup script...${NC}"
 pm2 startup systemd -u root --hp /root
 echo -e "${GREEN}PM2 startup configured${NC}"
 
