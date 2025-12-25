@@ -770,7 +770,7 @@
         // Check authentication status on load
         async function checkAuth() {
             try {
-                const res = await fetch('/api/auth/check');
+                const res = await fetch('/otp-service/api/auth/check');
                 const data = await res.json();
                 isAuthenticated = data.authenticated;
                 
@@ -803,7 +803,7 @@
             submitBtn.innerHTML = '<i class="hgi hgi-loading-01"></i><span>Logging in...</span>';
 
             try {
-                const res = await fetch('/api/login', {
+                const res = await fetch('/otp-service/api/login', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ email, password })
@@ -833,7 +833,7 @@
         // Logout handler
         document.getElementById('logoutBtn').addEventListener('click', async () => {
             try {
-                await fetch('/api/logout', { method: 'POST' });
+                await fetch('/otp-service/api/logout', { method: 'POST' });
                 isAuthenticated = false;
                 checkAuth();
                 if (statusInterval) clearInterval(statusInterval);
@@ -898,7 +898,7 @@
         async function checkQrCode() {
             try {
                 console.log('🔍 Checking for QR code...');
-                const res = await fetch('/api/qr');
+                const res = await fetch('/otp-service/api/qr');
                 const data = await res.json();
                 
                 console.log('📦 QR Response:', data);
@@ -965,7 +965,7 @@
 
         async function disconnect() {
             try {
-                const res = await fetch('/api/disconnect', { method: 'POST' });
+                const res = await fetch('/otp-service/api/disconnect', { method: 'POST' });
                 const data = await res.json();
                 
                 if (data.success) {
