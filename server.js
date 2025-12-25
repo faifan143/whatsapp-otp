@@ -135,6 +135,7 @@ registerRoute("post", "/api/logout", (req, res) => {
 });
 
 let currentQR = null;
+let qrPromiseResolvers = []; // Store all waiting promises
 
 const AUTH_DIR = "./.wwebjs_auth";
 if (!fs.existsSync(AUTH_DIR)) fs.mkdirSync(AUTH_DIR, { recursive: true });
@@ -142,6 +143,7 @@ if (!fs.existsSync(AUTH_DIR)) fs.mkdirSync(AUTH_DIR, { recursive: true });
 let isAuthenticated = false;
 let isClientReady = false;
 let clientInitialized = false;
+let client = null;
 
 // Detect system Chromium path for Puppeteer
 const getChromiumPath = () => {
@@ -178,19 +180,27 @@ if (chromiumPath) {
   puppeteerConfig.executablePath = chromiumPath;
 }
 
-const client = new Client({
-  authStrategy: new LocalAuth({ clientId: "default", dataPath: AUTH_DIR }),
-  puppeteer: puppeteerConfig,
-  webVersionCache: {
-    type: "remote",
-    remotePath: "https://raw.githubusercontent.com/wppconnect-team/wa-version/main/html/2.2413.51-beta.html",
-  },
-});
+function createClient() {
+  return new Client({
+    authStrategy: new LocalAuth({ clientId: "default", dataPath: AUTH_DIR }),
+    puppeteer: puppeteerConfig,
+    webVersionCache: {
+      type: "remote",
+      remotePath: "https://raw.githubusercontent.com/wppconnect-team/wa-version/main/html/2.2413.51-beta.html",
+    },
+  });
+}
+
+client = createClient();
 
 client.on("qr", (qr) => {
   if (qr) {
     qrcode.generate(qr, { small: true });
-    currentQR = qr; 
+    currentQR = qr;
+    
+    // Resolve all waiting promises
+    qrPromiseResolvers.forEach(resolve => resolve(qr));
+    qrPromiseResolvers = [];
   } else {
     currentQR = null;
   }
@@ -349,31 +359,75 @@ registerRoute("get", "/status", (req, res) => {
   });
 });
 
-registerRoute("get", "/api/qr", requireAuth, (req, res) => {
+// FIXED: /api/qr endpoint with proper QR waiting logic
+registerRoute("get", "/api/qr", requireAuth, async (req, res) => {
   // Prevent caching
   res.set('Cache-Control', 'no-cache, no-store, must-revalidate');
   res.set('Pragma', 'no-cache');
   res.set('Expires', '0');
   res.set('Content-Type', 'application/json');
   
-  // Initialize client if not initialized and no session exists (to generate QR)
-  const sessionPath = path.join(AUTH_DIR, "session-default");
-  const hasSession = fs.existsSync(sessionPath);
-  
-  if (!hasSession && !clientInitialized && !isClientReady && !isAuthenticated) {
-    clientInitialized = true;
-    client.initialize().catch(err => {
-      clientInitialized = false;
+  try {
+    // If we already have a QR code, return it immediately
+    if (currentQR) {
+      return res.status(200).json({ 
+        qr: currentQR,
+        ready: isClientReady,
+        authenticated: isAuthenticated,
+        timestamp: new Date().toISOString()
+      });
+    }
+    
+    // If client is already ready, don't wait for QR (it won't come)
+    if (isClientReady) {
+      return res.status(200).json({ 
+        qr: null,
+        ready: true,
+        authenticated: true,
+        timestamp: new Date().toISOString()
+      });
+    }
+    
+    // Check if client needs initialization
+    const sessionPath = path.join(AUTH_DIR, "session-default");
+    const hasSession = fs.existsSync(sessionPath);
+    
+    if (!hasSession && !clientInitialized && !isAuthenticated) {
+      console.log("[QR] No session found, initializing client...");
+      clientInitialized = true;
+      try {
+        await client.initialize();
+      } catch (err) {
+        console.error("[QR] Client initialization error:", err.message);
+        clientInitialized = false;
+      }
+    }
+    
+    // Wait for QR code with a timeout (max 10 seconds)
+    const qrPromise = new Promise((resolve) => {
+      qrPromiseResolvers.push(resolve);
+      // Timeout after 10 seconds
+      setTimeout(() => resolve(null), 10000);
+    });
+    
+    const qrCode = await qrPromise;
+    
+    res.status(200).json({ 
+      qr: qrCode || currentQR || null,
+      ready: isClientReady,
+      authenticated: isAuthenticated,
+      timestamp: new Date().toISOString()
+    });
+  } catch (error) {
+    console.error("[QR] Error:", error.message);
+    res.status(200).json({ 
+      qr: currentQR || null,
+      ready: isClientReady,
+      authenticated: isAuthenticated,
+      error: error.message,
+      timestamp: new Date().toISOString()
     });
   }
-  
-  // Simply return the current QR code status
-  res.status(200).json({ 
-    qr: currentQR || null,
-    ready: isClientReady,
-    authenticated: isAuthenticated,
-    timestamp: new Date().toISOString()
-  });
 });
 
 registerRoute("post", "/api/disconnect", requireAuth, async (req, res) => {
@@ -383,6 +437,10 @@ registerRoute("post", "/api/disconnect", requireAuth, async (req, res) => {
     currentQR = null;
     isAuthenticated = false;
     isClientReady = false;
+    
+    // Reject any waiting QR promises
+    qrPromiseResolvers.forEach(resolve => resolve(null));
+    qrPromiseResolvers = [];
     
     // Step 2: Notify all SSE clients IMMEDIATELY
     const disconnectMessage = JSON.stringify({ 
@@ -416,15 +474,20 @@ registerRoute("post", "/api/disconnect", requireAuth, async (req, res) => {
       }
     });
     
-    // Step 4: Destroy the client immediately
+    // Step 4: Destroy the client
     try {
-      await client.destroy();
+      if (client) {
+        await client.destroy();
+      }
     } catch (err) {
-      // Ignore destroy errors - client may already be destroyed
+      console.error("Client destroy error:", err.message);
     }
+    
+    // Step 5: Recreate a fresh client for next session
+    client = createClient();
     clientInitialized = false;
     
-    // Step 5: Aggressively delete session directory with multiple attempts
+    // Step 6: Aggressively delete session directory
     const sessionPath = path.join(AUTH_DIR, "session-default");
     for (let attempt = 0; attempt < 5; attempt++) {
       try {
@@ -448,19 +511,6 @@ registerRoute("post", "/api/disconnect", requireAuth, async (req, res) => {
       }
     }
     
-    // Step 6: Delete entire auth directory and recreate it fresh
-    try {
-      if (fs.existsSync(AUTH_DIR)) {
-        fs.rmSync(AUTH_DIR, { recursive: true, force: true });
-        await new Promise(resolve => setTimeout(resolve, 100));
-      }
-      if (!fs.existsSync(AUTH_DIR)) {
-        fs.mkdirSync(AUTH_DIR, { recursive: true });
-      }
-    } catch (err) {
-      // Ignore errors - directory will be recreated on next init
-    }
-    
     res.json({ 
       success: true, 
       message: "Completely disconnected.",
@@ -472,7 +522,6 @@ registerRoute("post", "/api/disconnect", requireAuth, async (req, res) => {
     res.status(500).json({ success: false, message: err.message });
   }
 });
-
 
 registerRoute("post", "/send-otp", requireAuth, async (req, res) => {
   const { phoneNumber, otp, purpose } = req.body;
@@ -533,15 +582,18 @@ const initialSessionPath = path.join(AUTH_DIR, "session-default");
 if (!fs.existsSync(initialSessionPath)) {
   clientInitialized = true;
   client.initialize().catch(err => {
+    console.error("Initial client initialization error:", err.message);
     clientInitialized = false;
   });
 }
 
 app.listen(port, "0.0.0.0", () => {
-  // Server started
+  console.log(`Server running on port ${port}`);
 });
 
 process.on("SIGINT", async () => {
-  await client.destroy();
+  if (client) {
+    await client.destroy();
+  }
   process.exit(0);
 });
