@@ -21,20 +21,45 @@ let isClientReady = false;
 let reconnectAttempts = 0;
 const MAX_RECONNECT_ATTEMPTS = 5;
 
+// Detect system Chromium path for Puppeteer
+const getChromiumPath = () => {
+  const possiblePaths = [
+    "/usr/bin/chromium-browser",
+    "/usr/bin/chromium",
+    "/snap/bin/chromium",
+  ];
+  
+  for (const chromiumPath of possiblePaths) {
+    if (fs.existsSync(chromiumPath)) {
+      return chromiumPath;
+    }
+  }
+  return undefined; // Use bundled Chromium if not found
+};
+
+const chromiumPath = getChromiumPath();
+const puppeteerConfig = {
+  headless: true,
+  args: [
+    "--no-sandbox",
+    "--disable-setuid-sandbox",
+    "--disable-dev-shm-usage",
+    "--disable-gpu",
+    "--mute-audio",
+    "--disable-blink-features=AutomationControlled",
+    "--disable-features=IsolateOrigins,site-per-process",
+  ],
+};
+
+// Use system Chromium if available
+if (chromiumPath) {
+  puppeteerConfig.executablePath = chromiumPath;
+  console.log(`[PUPPETEER] Using system Chromium: ${chromiumPath}`);
+}
+
 const client = new Client({
   authStrategy: new LocalAuth({ clientId: "default", dataPath: AUTH_DIR }),
-  puppeteer: {
-    headless: true,
-    args: [
-      "--no-sandbox",
-      "--disable-setuid-sandbox",
-      "--disable-dev-shm-usage",
-      "--disable-gpu",
-      "--mute-audio",
-      "--disable-blink-features=AutomationControlled",
-      "--disable-features=IsolateOrigins,site-per-process",
-    ],
-  },
+  puppeteer: puppeteerConfig,
   webVersionCache: {
     type: "remote",
     remotePath: "https://raw.githubusercontent.com/wppconnect-team/wa-version/main/html/2.2413.51-beta.html",

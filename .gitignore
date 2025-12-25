@@ -1,3 +1,7 @@
 wwebjs_auth/
 .wwebjs_auth/
 node_modules/
+logs/
+.pm2/
+*.log
+.env
