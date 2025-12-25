@@ -356,6 +356,17 @@ registerRoute("get", "/api/qr", requireAuth, (req, res) => {
   res.set('Expires', '0');
   res.set('Content-Type', 'application/json');
   
+  // Initialize client if not initialized and no session exists (to generate QR)
+  const sessionPath = path.join(AUTH_DIR, "session-default");
+  const hasSession = fs.existsSync(sessionPath);
+  
+  if (!hasSession && !clientInitialized && !isClientReady && !isAuthenticated) {
+    clientInitialized = true;
+    client.initialize().catch(err => {
+      clientInitialized = false;
+    });
+  }
+  
   // Simply return the current QR code status
   res.status(200).json({ 
     qr: currentQR || null,
