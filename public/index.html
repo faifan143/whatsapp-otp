@@ -788,7 +788,6 @@
                     stopEventStream();
                 }
             } catch (error) {
-                console.error('Auth check failed:', error);
                 document.getElementById('loginContainer').classList.remove('hidden');
                 document.getElementById('mainContent').classList.add('hidden');
                 stopEventStream();
@@ -801,60 +800,47 @@
                 return; // Already connected
             }
 
-            console.log('🔌 Connecting to event stream...');
             eventSource = new EventSource('/otp-service/api/events');
 
             eventSource.onopen = () => {
-                console.log('✅ Event stream connected');
+                // Connected
             };
 
             eventSource.onmessage = (event) => {
                 try {
                     const data = JSON.parse(event.data);
-                    console.log('📨 Event received:', data);
 
                     switch (data.type) {
                         case 'qr_scanned':
-                            console.log('✅ QR code scanned!');
                             showAlert('QR code scanned successfully! WhatsApp is authenticating...', 'success');
-                            // Update status immediately
                             updateStatusElement('statusAuth', true);
                             break;
                         
                         case 'ready':
-                            console.log('✅ WhatsApp client is ready!');
                             showAlert('WhatsApp is ready! You can now send messages.', 'success');
                             updateStatusElement('statusReady', true);
                             updateStatusElement('statusAuth', true);
-                            // Hide QR container since we're ready
                             document.getElementById('qrContainer').classList.add('hidden');
-                            // Show disconnect button, hide reconnect button
                             document.getElementById('disconnectBtn').classList.remove('hidden');
                             document.getElementById('reconnectBtn').classList.add('hidden');
                             break;
                         
                         case 'qr_generated':
-                            console.log('📱 New QR code generated');
-                            showAlert('New QR code generated. Please scan it with your phone.', 'warning');
-                            // Show QR container
+                            showAlert('New QR code generated. Please scan it with your phone.', 'success');
                             document.getElementById('qrContainer').classList.remove('hidden');
-                            // Refresh QR code
                             checkQrCode();
                             break;
                         
                         case 'disconnected':
-                            console.log('🔌 WhatsApp disconnected');
-                            showAlert('WhatsApp disconnected successfully.', 'warning');
+                            showAlert('WhatsApp disconnected successfully.', 'success');
                             updateStatusElement('statusReady', false);
                             updateStatusElement('statusAuth', false);
-                            // Show reconnect button, hide disconnect button
                             document.getElementById('disconnectBtn').classList.add('hidden');
                             document.getElementById('reconnectBtn').classList.remove('hidden');
                             document.getElementById('qrContainer').classList.add('hidden');
                             break;
                         
                         case 'status':
-                            // Update status from server
                             if (data.data) {
                                 updateStatusElement('statusReady', data.data.ready);
                                 updateStatusElement('statusAuth', data.data.authenticated);
@@ -863,22 +849,16 @@
                                 }
                             }
                             break;
-                        
-                        case 'connected':
-                            console.log('🔗 Connected to real-time updates');
-                            break;
                     }
                 } catch (error) {
-                    console.error('Error parsing event data:', error);
+                    // Error parsing event
                 }
             };
 
             eventSource.onerror = (error) => {
-                console.error('❌ Event stream error:', error);
                 // Try to reconnect after 3 seconds
                 setTimeout(() => {
                     if (eventSource && eventSource.readyState === EventSource.CLOSED) {
-                        console.log('🔄 Reconnecting to event stream...');
                         stopEventStream();
                         startEventStream();
                     }
@@ -889,7 +869,6 @@
         // Stop event stream
         function stopEventStream() {
             if (eventSource) {
-                console.log('🔌 Disconnecting from event stream...');
                 eventSource.close();
                 eventSource = null;
             }
@@ -945,7 +924,7 @@
                 stopEventStream();
                 checkAuth();
             } catch (error) {
-                console.error('Logout failed:', error);
+                // Logout error
             }
         });
 
@@ -976,7 +955,7 @@
                     document.getElementById('qrContainer').classList.add('hidden');
                 }
             } catch (error) {
-                console.error('Status error:', error);
+                // Status error
             }
         }
 
@@ -1003,20 +982,14 @@
 
         async function checkQrCode() {
             try {
-                console.log('🔍 Checking for QR code...');
                 const res = await fetch('/otp-service/api/qr');
                 const data = await res.json();
                 
-                console.log('📦 QR Response:', data);
-                
                 if (data && data.qr) {
-                    console.log('✅ QR code found!');
                     displayQRCode(data.qr);
-                } else {
-                    console.log('⏳ No QR code yet');
                 }
             } catch (error) {
-                console.error('❌ QR fetch error:', error);
+                // QR fetch error
             }
         }
 
@@ -1026,25 +999,18 @@
                 const qrCodeDiv = document.getElementById('qrCode');
                 
                 if (!qrContainer || !qrCodeDiv) {
-                    console.error('❌ QR elements not found in DOM');
                     return;
                 }
                 
-                console.log('📍 Showing QR container');
                 qrContainer.classList.remove('hidden');
                 
                 if (!qrString || typeof qrString !== 'string' || qrString.trim() === '') {
-                    console.log('⚠️ Invalid QR string');
                     qrCodeDiv.innerHTML = '<p style="color: #ef4444; font-size: 13px;">Waiting for QR code...</p>';
                     return;
                 }
                 
-                console.log('🎨 Generating QR code from string:', qrString.substring(0, 50) + '...');
-                
-                // Clear div
                 qrCodeDiv.innerHTML = '';
                 
-                // Use QR Server API - reliable and no library needed
                 const encodedStr = encodeURIComponent(qrString);
                 const img = document.createElement('img');
                 img.src = `https://api.qrserver.com/v1/create-qr-code/?size=220x220&data=${encodedStr}`;
@@ -1054,18 +1020,13 @@
                 img.style.display = 'block';
                 img.style.margin = '0 auto';
                 
-                img.onload = () => {
-                    console.log('✅ QR code rendered successfully!');
-                };
-                
                 img.onerror = () => {
-                    console.error('❌ Failed to load QR image');
                     qrCodeDiv.innerHTML = '<p style="color: #ef4444; font-size: 13px;">Failed to generate QR code</p>';
                 };
                 
                 qrCodeDiv.appendChild(img);
             } catch (error) {
-                console.error('❌ QR display error:', error);
+                // QR display error
             }
         }
 
@@ -1076,10 +1037,8 @@
                 
                 if (data.success) {
                     showAlert(data.message || 'Disconnected successfully. Click Reconnect to generate a new QR code.', 'success');
-                    // Hide disconnect button, show reconnect button
                     document.getElementById('disconnectBtn').classList.add('hidden');
                     document.getElementById('reconnectBtn').classList.remove('hidden');
-                    // Hide QR container initially (will show when reconnecting)
                     document.getElementById('qrContainer').classList.add('hidden');
                 } else {
                     showAlert('Failed: ' + data.message, 'error');
@@ -1101,12 +1060,9 @@
                 
                 if (data.success) {
                     showAlert(data.message || 'Reconnecting... QR code will appear shortly.', 'success');
-                    // Show QR container
                     document.getElementById('qrContainer').classList.remove('hidden');
-                    // Hide reconnect button, show disconnect button
                     document.getElementById('reconnectBtn').classList.add('hidden');
                     document.getElementById('disconnectBtn').classList.remove('hidden');
-                    // Refresh QR code check
                     checkQrCode();
                 } else {
                     showAlert('Failed: ' + data.message, 'error');
@@ -1150,7 +1106,7 @@
             btn.innerHTML = '<i class="hgi hgi-loading-01"></i><span>Sending</span>';
 
             try {
-                const res = await fetch('/send-message', {
+                const res = await fetch('/otp-service/send-message', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ phoneNumber, message })
@@ -1182,8 +1138,6 @@
 
         // Single initialization point
         document.addEventListener('DOMContentLoaded', () => {
-            console.log('🚀 Initializing WhatsApp OTP Service');
-            
             const modal = document.getElementById('confirmModal');
             if (modal) {
                 modal.addEventListener('click', (e) => {
@@ -1202,10 +1156,7 @@
                 }
             });
 
-            // Check authentication first
             checkAuth();
-            
-            console.log('✅ Service ready');
         });
     </script>
 </body>

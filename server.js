@@ -40,7 +40,6 @@ function registerRoute(method, path, ...handlers) {
           await result;
         }
       } catch (error) {
-        console.error(`[ROUTE ERROR] ${method.toUpperCase()} ${path}:`, error);
         if (!res.headersSent) {
           res.status(500).json({ error: error.message || 'Internal server error' });
         }
@@ -107,7 +106,6 @@ registerRoute("get", "/api/events", requireAuth, (req, res) => {
   // Remove client on disconnect
   req.on('close', () => {
     sseClients.delete(res);
-    console.log('[SSE] Client disconnected, remaining clients:', sseClients.size);
   });
   
   // Keep connection alive with heartbeat
@@ -180,7 +178,6 @@ const puppeteerConfig = {
 // Use system Chromium if available
 if (chromiumPath) {
   puppeteerConfig.executablePath = chromiumPath;
-  console.log(`[PUPPETEER] Using system Chromium: ${chromiumPath}`);
 }
 
 const client = new Client({
@@ -193,13 +190,10 @@ const client = new Client({
 });
 
 client.on("qr", (qr) => {
-  console.log("[QR] QR code generated! Length:", qr ? qr.length : 0);
   if (qr) {
     qrcode.generate(qr, { small: true });
     currentQR = qr; 
-    console.log("[QR] currentQR set successfully, length:", currentQR.length);
   } else {
-    console.log("[QR] WARNING: QR code is null or undefined!");
     currentQR = null;
   }
   isAuthenticated = false;
@@ -216,13 +210,12 @@ client.on("qr", (qr) => {
     try {
       client.write(`data: ${message}\n\n`);
     } catch (err) {
-      console.error('[SSE] Error sending to client:', err);
+      // Client disconnected
     }
   });
 });
 
 client.on("authenticated", () => {
-  console.log("[AUTH] WhatsApp authenticated! QR code scanned successfully!");
   isAuthenticated = true;
   reconnectAttempts = 0;
   
@@ -236,13 +229,12 @@ client.on("authenticated", () => {
     try {
       client.write(`data: ${message}\n\n`);
     } catch (err) {
-      console.error('[SSE] Error sending to client:', err);
+      // Client disconnected
     }
   });
 });
 
 client.on("ready", () => {
-  console.log("[READY] WhatsApp client is ready to send messages!");
   isClientReady = true;
   isAuthenticated = true;
   reconnectAttempts = 0;
@@ -258,20 +250,18 @@ client.on("ready", () => {
     try {
       client.write(`data: ${message}\n\n`);
     } catch (err) {
-      console.error('[SSE] Error sending to client:', err);
+      // Client disconnected
     }
   });
 });
 
 client.on("disconnected", async (reason) => {
-  console.log("[DISCONNECT] Reason:", reason);
   isAuthenticated = false;
   isClientReady = false;
   currentQR = null; // Clear QR on disconnect
   
   // Don't auto-reconnect if it was a manual disconnect
   if (isManualDisconnect) {
-    console.log("[DISCONNECT] Manual disconnect - not auto-reconnecting");
     isManualDisconnect = false; // Reset flag
     return;
   }
@@ -279,24 +269,18 @@ client.on("disconnected", async (reason) => {
   // Only auto-reconnect if it's an unexpected disconnect AND session still exists
   const sessionPath = path.join(AUTH_DIR, "session-default");
   if ((reason === "LOGOUT" || reason === "NAVIGATION") && fs.existsSync(sessionPath)) {
-    console.log("[RECONNECT] Unexpected disconnect with session - attempting to reconnect...");
     if (reconnectAttempts < MAX_RECONNECT_ATTEMPTS) {
       reconnectAttempts++;
       setTimeout(() => {
         client.initialize().catch(err => {
-          console.error("[RECONNECT ERROR]", err.message);
+          // Reconnection failed
         });
       }, 5000 * reconnectAttempts);
-    } else {
-      console.error("[RECONNECT] Max reconnection attempts reached. Manual intervention required.");
     }
-  } else {
-    console.log("[DISCONNECT] No session found or not a reconnectable reason - not auto-reconnecting");
   }
 });
 
 client.on("auth_failure", (msg) => {
-  console.error("[AUTH FAILURE]", msg);
   isAuthenticated = false;
   isClientReady = false;
 });
@@ -325,7 +309,6 @@ async function getChatId(phoneNumber) {
     }
     return formattedNumber + "@c.us";
   } catch (err) {
-    console.error("[GET-CHAT-ID ERROR]", err.message);
     const formattedNumber = formatPhoneToE164(phoneNumber);
     return formattedNumber + "@c.us";
   }
@@ -339,14 +322,11 @@ async function sendMessageWithRetry(phoneNumber, text, maxRetries = 3) {
         throw new Error("WhatsApp client is not ready");
       }
       const chatId = await getChatId(phoneNumber);
-      console.log(`[SEND] Resolved chat ID: ${chatId} for phone: ${phoneNumber}`);
       const result = await client.sendMessage(chatId, text);
       return result;
     } catch (err) {
       lastError = err;
-      console.log(`[SEND] Attempt ${i + 1} failed: ${err.message}`);
       if (err.message.includes("LID") || err.message.includes("No LID")) {
-        console.log("[SEND] LID error detected, waiting before retry...");
         await new Promise(r => setTimeout(r, 3000));
       } else if (i < maxRetries - 1) {
         await new Promise(r => setTimeout(r, 2000));
@@ -390,23 +370,8 @@ registerRoute("get", "/api/qr", requireAuth, (req, res) => {
   const sessionPath = path.join(AUTH_DIR, "session-default");
   const hasSession = fs.existsSync(sessionPath);
   
-  console.log("[QR API] Request received. Current state:", {
-    hasQR: currentQR !== null,
-    qrLength: currentQR ? currentQR.length : 0,
-    isReady: isClientReady,
-    isAuthenticated: isAuthenticated,
-    hasSession: hasSession,
-    clientInitialized: clientInitialized,
-    isManualDisconnect: isManualDisconnect
-  });
-  
-  // CRITICAL: WhatsApp Web.js only generates QR codes when there's NO session
-  // If a session exists, it authenticates automatically and skips QR generation
-  // So if we need a QR code, we must ensure there's no session
-  
   // If client is ready/authenticated, no QR is needed
   if (isClientReady || isAuthenticated) {
-    console.log("[QR API] Client is ready/authenticated - no QR needed");
     return res.status(200).json({ 
       qr: null,
       ready: isClientReady,
@@ -417,7 +382,6 @@ registerRoute("get", "/api/qr", requireAuth, (req, res) => {
   
   // If session exists but client is not ready, it's authenticating (no QR will be generated)
   if (hasSession) {
-    console.log("[QR API] Session exists - client will authenticate automatically, no QR will be generated");
     return res.status(200).json({ 
       qr: null,
       ready: false,
@@ -429,25 +393,13 @@ registerRoute("get", "/api/qr", requireAuth, (req, res) => {
   
   // No session exists - QR should be generated
   if (!hasSession && !currentQR) {
-    console.log("[QR API] No session and no QR - ensuring client is initialized to generate QR...");
-    
     // Initialize client if not already initialized (will generate QR since no session)
     if (!clientInitialized && !isManualDisconnect) {
-      console.log("[QR API] Initializing client to generate QR code...");
       initializeClientIfNeeded();
-    } else if (isManualDisconnect) {
-      console.log("[QR API] Manual disconnect in progress - client will not initialize");
-    } else {
-      console.log("[QR API] Client already initialized, waiting for QR generation...");
     }
   }
   
   // Return current QR status
-  console.log("[QR API] Returning QR status:", {
-    hasQR: currentQR !== null,
-    qrLength: currentQR ? currentQR.length : 0
-  });
-  
   res.status(200).json({ 
     qr: currentQR || null,
     ready: isClientReady,
@@ -461,7 +413,6 @@ registerRoute("post", "/api/disconnect", requireAuth, async (req, res) => {
     // Set manual disconnect flag FIRST to prevent auto-reconnect
     isManualDisconnect = true;
     clientInitialized = false; // Mark as not initialized
-    console.log("[DISCONNECT] Manual disconnect initiated, flag set to prevent auto-reconnect");
     
     // Clear state first
     currentQR = null;
@@ -471,41 +422,27 @@ registerRoute("post", "/api/disconnect", requireAuth, async (req, res) => {
     
     // Destroy the client FIRST to prevent it from recreating session
     try {
-      console.log("[DISCONNECT] Destroying client first...");
       await client.destroy();
       clientInitialized = false;
-      console.log("[DISCONNECT] Client destroyed successfully");
       // Wait for cleanup
       await new Promise(resolve => setTimeout(resolve, 2000));
     } catch (err) {
-      console.log("[DISCONNECT] Error destroying client (may already be destroyed):", err.message);
       clientInitialized = false;
     }
     
     // Delete the session directory AFTER destroying client
     const sessionPath = path.join(AUTH_DIR, "session-default");
     if (fs.existsSync(sessionPath)) {
-      console.log("[DISCONNECT] Deleting session directory:", sessionPath);
       fs.rmSync(sessionPath, { recursive: true, force: true });
-      console.log("[DISCONNECT] Session directory deleted");
       
       // Verify deletion with retries
       await new Promise(resolve => setTimeout(resolve, 500));
       let retries = 0;
       while (fs.existsSync(sessionPath) && retries < 3) {
-        console.log(`[DISCONNECT] Session still exists, retrying deletion (${retries + 1}/3)...`);
         fs.rmSync(sessionPath, { recursive: true, force: true });
         await new Promise(resolve => setTimeout(resolve, 500));
         retries++;
       }
-      
-      if (fs.existsSync(sessionPath)) {
-        console.error("[DISCONNECT] ERROR: Session directory still exists after multiple deletion attempts!");
-      } else {
-        console.log("[DISCONNECT] Session directory confirmed deleted");
-      }
-    } else {
-      console.log("[DISCONNECT] No session directory found to delete");
     }
     
     // Notify SSE clients about disconnection
@@ -518,13 +455,12 @@ registerRoute("post", "/api/disconnect", requireAuth, async (req, res) => {
       try {
         client.write(`data: ${message}\n\n`);
       } catch (err) {
-        console.error('[SSE] Error sending to client:', err);
+        // Client disconnected
       }
     });
     
     res.json({ success: true, message: "Disconnected successfully. Click 'Reconnect' to generate a new QR code." });
   } catch (err) {
-    console.error("[DISCONNECT ERROR]", err.message);
     isManualDisconnect = false; // Reset flag on error
     clientInitialized = false;
     res.status(500).json({ success: false, message: err.message });
@@ -542,29 +478,20 @@ registerRoute("post", "/api/reconnect", requireAuth, async (req, res) => {
     // Ensure session is deleted before reconnecting (CRITICAL for QR generation)
     const sessionPath = path.join(AUTH_DIR, "session-default");
     if (fs.existsSync(sessionPath)) {
-      console.log("[RECONNECT] Removing existing session to force QR generation...");
       fs.rmSync(sessionPath, { recursive: true, force: true });
       // Double-check deletion
       if (fs.existsSync(sessionPath)) {
-        console.error("[RECONNECT] ERROR: Session still exists after deletion!");
-        // Try again with more force
         fs.rmSync(sessionPath, { recursive: true, force: true, maxRetries: 3 });
-      } else {
-        console.log("[RECONNECT] Session removed successfully");
       }
-    } else {
-      console.log("[RECONNECT] No session found (good, will generate QR)");
     }
     
     // If client is already initialized, destroy it first
     try {
-      console.log("[RECONNECT] Destroying existing client...");
       await client.destroy();
       clientInitialized = false;
       // Wait for cleanup
       await new Promise(resolve => setTimeout(resolve, 2000));
     } catch (err) {
-      console.log("[RECONNECT] Client already destroyed or error:", err.message);
       clientInitialized = false;
     }
     
@@ -573,14 +500,10 @@ registerRoute("post", "/api/reconnect", requireAuth, async (req, res) => {
     isAuthenticated = false;
     isClientReady = false;
     
-    console.log("[RECONNECT] Initializing client to generate QR code (no session = will generate QR)...");
-    
     // Initialize client to generate new QR code (no session = will generate QR)
     client.initialize().then(() => {
-      console.log("[RECONNECT] Client initialization started");
       clientInitialized = true;
     }).catch(err => {
-      console.error("[RECONNECT INIT ERROR]", err.message);
       clientInitialized = false;
     });
     
@@ -590,20 +513,16 @@ registerRoute("post", "/api/reconnect", requireAuth, async (req, res) => {
       await new Promise(resolve => setTimeout(resolve, 500));
       if (currentQR) {
         qrGenerated = true;
-        console.log("[RECONNECT] QR code generated successfully! Length:", currentQR.length);
         break;
       }
-      console.log(`[RECONNECT] Waiting for QR... (${i + 1}/20)`);
     }
     
     if (qrGenerated) {
       res.json({ success: true, message: "Reconnected! QR code is ready.", qr: currentQR });
     } else {
-      console.log("[RECONNECT] QR code not generated yet, but initialization started");
       res.json({ success: true, message: "Reconnecting... QR code will appear shortly." });
     }
   } catch (err) {
-    console.error("[RECONNECT ERROR]", err.message);
     res.status(500).json({ success: false, message: err.message });
   }
 });
@@ -627,7 +546,6 @@ registerRoute("post", "/send-otp", requireAuth, async (req, res) => {
     await sendMessageWithRetry(phoneNumber, msg);
     res.json({ success: true, message: "OTP sent successfully" });
   } catch (err) {
-    console.error("[SEND-OTP ERROR]", err.message);
     res.status(500).json({
       success: false,
       message: "Failed to send OTP: " + err.message,
@@ -653,7 +571,6 @@ registerRoute("post", "/send-message", requireAuth, async (req, res) => {
     await sendMessageWithRetry(phoneNumber, message);
     res.json({ success: true, message: "Message sent successfully" });
   } catch (err) {
-    console.error("[SEND-MESSAGE ERROR]", err.message);
     res.status(500).json({
       success: false,
       message: "Failed to send message: " + err.message,
@@ -665,31 +582,18 @@ registerRoute("post", "/send-message", requireAuth, async (req, res) => {
 app.use(express.static(path.join(__dirname, "public")));
 
 // Initialize client on server start ONLY if not manually disconnected
-// We'll initialize it lazily when needed
 let clientInitialized = false;
 
 function initializeClientIfNeeded() {
   if (clientInitialized || isManualDisconnect) {
-    if (isManualDisconnect) {
-      console.log("[INIT] Skipping initialization - manual disconnect in progress");
-    }
     return;
   }
   
-  console.log("[INIT] Starting WhatsApp client initialization...");
   const sessionPath = path.join(AUTH_DIR, "session-default");
-  if (fs.existsSync(sessionPath)) {
-    console.log("[INIT] Existing session found, client will try to authenticate automatically (NO QR will be generated)");
-  } else {
-    console.log("[INIT] No session found, QR code WILL be generated");
-  }
 
   client.initialize().then(() => {
-    console.log("[INIT] Client initialization started successfully");
     clientInitialized = true;
   }).catch(err => {
-    console.error("[INIT ERROR]", err.message);
-    console.error("[INIT ERROR] Stack:", err.stack);
     clientInitialized = false;
   });
 }
@@ -697,17 +601,13 @@ function initializeClientIfNeeded() {
 // Initialize on server start (only if not manually disconnected)
 if (!isManualDisconnect) {
   initializeClientIfNeeded();
-} else {
-  console.log("[INIT] Server start - skipping initialization due to manual disconnect");
 }
 
 app.listen(port, "0.0.0.0", () => {
-  console.log(`[SERVER] Running on http://0.0.0.0:${port}`);
-  console.log(`[SERVER] Routes registered with /otp-service prefix support`);
+  // Server started
 });
 
 process.on("SIGINT", async () => {
-  console.log("[SHUTDOWN] Closing...");
   await client.destroy();
   process.exit(0);
 });
