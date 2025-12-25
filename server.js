@@ -141,9 +141,7 @@ if (!fs.existsSync(AUTH_DIR)) fs.mkdirSync(AUTH_DIR, { recursive: true });
 
 let isAuthenticated = false;
 let isClientReady = false;
-let reconnectAttempts = 0;
-const MAX_RECONNECT_ATTEMPTS = 5;
-let isManualDisconnect = false; // Flag to prevent auto-reconnect on manual disconnect
+let clientInitialized = false;
 
 // Detect system Chromium path for Puppeteer
 const getChromiumPath = () => {
@@ -198,7 +196,6 @@ client.on("qr", (qr) => {
   }
   isAuthenticated = false;
   isClientReady = false;
-  reconnectAttempts = 0;
   
   // Notify all SSE clients that new QR code is available
   const message = JSON.stringify({ 
@@ -217,7 +214,6 @@ client.on("qr", (qr) => {
 
 client.on("authenticated", () => {
   isAuthenticated = true;
-  reconnectAttempts = 0;
   
   // Notify all SSE clients that QR was scanned
   const message = JSON.stringify({ 
@@ -237,7 +233,6 @@ client.on("authenticated", () => {
 client.on("ready", () => {
   isClientReady = true;
   isAuthenticated = true;
-  reconnectAttempts = 0;
   currentQR = null;
   
   // Notify all SSE clients that client is ready
@@ -258,26 +253,22 @@ client.on("ready", () => {
 client.on("disconnected", async (reason) => {
   isAuthenticated = false;
   isClientReady = false;
-  currentQR = null; // Clear QR on disconnect
+  currentQR = null;
+  clientInitialized = false;
   
-  // Don't auto-reconnect if it was a manual disconnect
-  if (isManualDisconnect) {
-    isManualDisconnect = false; // Reset flag
-    return;
-  }
-  
-  // Only auto-reconnect if it's an unexpected disconnect AND session still exists
-  const sessionPath = path.join(AUTH_DIR, "session-default");
-  if ((reason === "LOGOUT" || reason === "NAVIGATION") && fs.existsSync(sessionPath)) {
-    if (reconnectAttempts < MAX_RECONNECT_ATTEMPTS) {
-      reconnectAttempts++;
-      setTimeout(() => {
-        client.initialize().catch(err => {
-          // Reconnection failed
-        });
-      }, 5000 * reconnectAttempts);
+  // Notify all SSE clients that client disconnected
+  const message = JSON.stringify({ 
+    type: 'disconnected', 
+    message: 'WhatsApp client disconnected',
+    timestamp: new Date().toISOString()
+  });
+  sseClients.forEach(client => {
+    try {
+      client.write(`data: ${message}\n\n`);
+    } catch (err) {
+      // Client disconnected
     }
-  }
+  });
 });
 
 client.on("auth_failure", (msg) => {
@@ -342,7 +333,6 @@ registerRoute("get", "/health", (req, res) => {
     status: "ok",
     authenticated: isAuthenticated,
     ready: isClientReady,
-    reconnectAttempts: reconnectAttempts,
   });
 });
 
@@ -355,12 +345,11 @@ registerRoute("get", "/status", (req, res) => {
   res.json({
     authenticated: isAuthenticated,
     ready: isClientReady,
-    reconnectAttempts: reconnectAttempts,
     timestamp: new Date().toISOString(),
   });
 });
 
-registerRoute("get", "/api/qr", requireAuth, (req, res) => {
+registerRoute("get", "/api/qr", requireAuth, async (req, res) => {
   // Prevent caching
   res.set('Cache-Control', 'no-cache, no-store, must-revalidate');
   res.set('Pragma', 'no-cache');
@@ -391,15 +380,37 @@ registerRoute("get", "/api/qr", requireAuth, (req, res) => {
     });
   }
   
-  // No session exists - QR should be generated
+  // No session exists - ensure QR is generated
   if (!hasSession && !currentQR) {
     // Initialize client if not already initialized (will generate QR since no session)
-    if (!clientInitialized && !isManualDisconnect) {
-      initializeClientIfNeeded();
+    if (!clientInitialized) {
+      try {
+        clientInitialized = true;
+        await client.initialize();
+      } catch (err) {
+        clientInitialized = false;
+        // Continue - will return null and frontend can retry
+      }
+    }
+    
+    // Wait up to 15 seconds for QR code to be generated
+    // This handles both newly initialized clients and clients that are already initializing
+    if (clientInitialized) {
+      for (let i = 0; i < 30; i++) {
+        await new Promise(resolve => setTimeout(resolve, 500));
+        if (currentQR) {
+          break;
+        }
+        // If client is no longer initialized, stop waiting
+        if (!clientInitialized) {
+          break;
+        }
+      }
     }
   }
   
   // Return current QR status
+  // Only return null if client is ready/authenticated, otherwise return QR (may be null if still generating)
   res.status(200).json({ 
     qr: currentQR || null,
     ready: isClientReady,
@@ -410,17 +421,13 @@ registerRoute("get", "/api/qr", requireAuth, (req, res) => {
 
 registerRoute("post", "/api/disconnect", requireAuth, async (req, res) => {
   try {
-    // Step 1: Set flags to prevent auto-reconnect
-    isManualDisconnect = true;
+    // Step 1: Clear all state IMMEDIATELY
     clientInitialized = false;
-    
-    // Step 2: Clear all state IMMEDIATELY
     currentQR = null;
     isAuthenticated = false;
     isClientReady = false;
-    reconnectAttempts = 0;
     
-    // Step 3: Notify all SSE clients IMMEDIATELY
+    // Step 2: Notify all SSE clients IMMEDIATELY
     const disconnectMessage = JSON.stringify({ 
       type: 'disconnected', 
       message: 'WhatsApp disconnected successfully',
@@ -434,7 +441,7 @@ registerRoute("post", "/api/disconnect", requireAuth, async (req, res) => {
       }
     });
     
-    // Step 4: Send immediate status update
+    // Step 3: Send immediate status update
     const statusMessage = JSON.stringify({
       type: 'status',
       data: {
@@ -452,7 +459,7 @@ registerRoute("post", "/api/disconnect", requireAuth, async (req, res) => {
       }
     });
     
-    // Step 5: Destroy the client immediately
+    // Step 4: Destroy the client immediately
     try {
       await client.destroy();
     } catch (err) {
@@ -460,7 +467,7 @@ registerRoute("post", "/api/disconnect", requireAuth, async (req, res) => {
     }
     clientInitialized = false;
     
-    // Step 6: Aggressively delete session directory with multiple attempts
+    // Step 5: Aggressively delete session directory with multiple attempts
     const sessionPath = path.join(AUTH_DIR, "session-default");
     for (let attempt = 0; attempt < 5; attempt++) {
       try {
@@ -484,7 +491,7 @@ registerRoute("post", "/api/disconnect", requireAuth, async (req, res) => {
       }
     }
     
-    // Step 7: Delete entire auth directory and recreate it fresh
+    // Step 6: Delete entire auth directory and recreate it fresh
     try {
       if (fs.existsSync(AUTH_DIR)) {
         fs.rmSync(AUTH_DIR, { recursive: true, force: true });
@@ -497,9 +504,6 @@ registerRoute("post", "/api/disconnect", requireAuth, async (req, res) => {
       // Ignore errors - directory will be recreated on next init
     }
     
-    // Step 8: Reset manual disconnect flag for next reconnect
-    isManualDisconnect = false;
-    
     res.json({ 
       success: true, 
       message: "Completely disconnected. Click 'Reconnect' to generate a new QR code.",
@@ -507,7 +511,6 @@ registerRoute("post", "/api/disconnect", requireAuth, async (req, res) => {
     });
     
   } catch (err) {
-    isManualDisconnect = false;
     clientInitialized = false;
     res.status(500).json({ success: false, message: err.message });
   }
@@ -516,26 +519,22 @@ registerRoute("post", "/api/disconnect", requireAuth, async (req, res) => {
 // Reconnect endpoint - manually initialize client to generate new QR code
 registerRoute("post", "/api/reconnect", requireAuth, async (req, res) => {
   try {
-    // Step 1: Reset flags
-    isManualDisconnect = false;
-    reconnectAttempts = 0;
+    // Step 1: Clear state
     clientInitialized = false;
-    
-    // Step 2: Clear state
     currentQR = null;
     isAuthenticated = false;
     isClientReady = false;
     
-    // Step 3: Destroy old client completely
+    // Step 2: Destroy old client completely
     try {
       await client.destroy();
-      clientInitialized = false;
       await new Promise(resolve => setTimeout(resolve, 1000));
     } catch (err) {
-      clientInitialized = false;
+      // Ignore destroy errors
     }
+    clientInitialized = false;
     
-    // Step 4: Ensure auth directory is completely clean
+    // Step 3: Ensure auth directory is completely clean
     const sessionPath = path.join(AUTH_DIR, "session-default");
     for (let attempt = 0; attempt < 3; attempt++) {
       try {
@@ -548,7 +547,7 @@ registerRoute("post", "/api/reconnect", requireAuth, async (req, res) => {
       }
     }
     
-    // Step 5: Ensure auth directory exists for fresh start
+    // Step 4: Ensure auth directory exists for fresh start
     try {
       if (!fs.existsSync(AUTH_DIR)) {
         fs.mkdirSync(AUTH_DIR, { recursive: true });
@@ -557,14 +556,15 @@ registerRoute("post", "/api/reconnect", requireAuth, async (req, res) => {
       // Ignore
     }
     
-    // Step 6: Initialize fresh client to generate QR
+    // Step 5: Initialize fresh client to generate QR
+    clientInitialized = true;
     client.initialize().then(() => {
-      clientInitialized = true;
+      // Client initialized successfully
     }).catch(err => {
       clientInitialized = false;
     });
     
-    // Step 7: Wait for QR code to be generated
+    // Step 6: Wait for QR code to be generated
     let qrGenerated = false;
     for (let i = 0; i < 30; i++) { // Wait up to 15 seconds
       await new Promise(resolve => setTimeout(resolve, 500));
@@ -589,6 +589,7 @@ registerRoute("post", "/api/reconnect", requireAuth, async (req, res) => {
       });
     }
   } catch (err) {
+    clientInitialized = false;
     res.status(500).json({ success: false, message: err.message });
   }
 });
@@ -646,28 +647,6 @@ registerRoute("post", "/send-message", requireAuth, async (req, res) => {
 
 // Serve static files from public directory (must be last, after all API routes)
 app.use(express.static(path.join(__dirname, "public")));
-
-// Initialize client on server start ONLY if not manually disconnected
-let clientInitialized = false;
-
-function initializeClientIfNeeded() {
-  if (clientInitialized || isManualDisconnect) {
-    return;
-  }
-  
-  const sessionPath = path.join(AUTH_DIR, "session-default");
-
-  client.initialize().then(() => {
-    clientInitialized = true;
-  }).catch(err => {
-    clientInitialized = false;
-  });
-}
-
-// Initialize on server start (only if not manually disconnected)
-if (!isManualDisconnect) {
-  initializeClientIfNeeded();
-}
 
 app.listen(port, "0.0.0.0", () => {
   // Server started
