@@ -145,6 +145,7 @@ let isAuthenticated = false;
 let isClientReady = false;
 let reconnectAttempts = 0;
 const MAX_RECONNECT_ATTEMPTS = 5;
+let isManualDisconnect = false; // Flag to prevent auto-reconnect on manual disconnect
 
 // Detect system Chromium path for Puppeteer
 const getChromiumPath = () => {
@@ -260,6 +261,13 @@ client.on("disconnected", async (reason) => {
   console.log("[DISCONNECT] Reason:", reason);
   isAuthenticated = false;
   isClientReady = false;
+  
+  // Don't auto-reconnect if it was a manual disconnect
+  if (isManualDisconnect) {
+    console.log("[DISCONNECT] Manual disconnect - not auto-reconnecting");
+    isManualDisconnect = false; // Reset flag
+    return;
+  }
   
   // Only auto-reconnect if it's an unexpected disconnect (not manual logout)
   // Manual logout will have session deleted, so don't auto-reconnect
@@ -380,6 +388,9 @@ registerRoute("get", "/api/qr", requireAuth, (req, res) => {
 
 registerRoute("post", "/api/disconnect", requireAuth, async (req, res) => {
   try {
+    // Set manual disconnect flag to prevent auto-reconnect
+    isManualDisconnect = true;
+    
     // Destroy the client first
     await client.destroy();
     
@@ -396,19 +407,53 @@ registerRoute("post", "/api/disconnect", requireAuth, async (req, res) => {
       console.log("[DISCONNECT] Session directory deleted");
     }
     
-    // Wait a bit for cleanup, then reinitialize
-    setTimeout(async () => {
+    // Notify SSE clients about disconnection
+    const message = JSON.stringify({ 
+      type: 'disconnected', 
+      message: 'WhatsApp disconnected successfully',
+      timestamp: new Date().toISOString()
+    });
+    sseClients.forEach(client => {
       try {
-        await client.initialize();
-        // QR code will be generated automatically via the 'qr' event
+        client.write(`data: ${message}\n\n`);
       } catch (err) {
-        console.error("[REINIT ERROR]", err.message);
+        console.error('[SSE] Error sending to client:', err);
       }
-    }, 2000);
+    });
     
-    res.json({ success: true, message: "Disconnected. New QR code will appear shortly." });
+    res.json({ success: true, message: "Disconnected successfully. Click 'Reconnect' to generate a new QR code." });
   } catch (err) {
     console.error("[DISCONNECT ERROR]", err.message);
+    isManualDisconnect = false; // Reset flag on error
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// Reconnect endpoint - manually initialize client to generate new QR code
+registerRoute("post", "/api/reconnect", requireAuth, async (req, res) => {
+  try {
+    // Reset manual disconnect flag
+    isManualDisconnect = false;
+    reconnectAttempts = 0;
+    
+    // If client is already initialized, destroy it first
+    try {
+      await client.destroy();
+    } catch (err) {
+      // Ignore errors if client is already destroyed
+    }
+    
+    // Clear state
+    currentQR = null;
+    isAuthenticated = false;
+    isClientReady = false;
+    
+    // Initialize client to generate new QR code
+    await client.initialize();
+    
+    res.json({ success: true, message: "Reconnecting... QR code will appear shortly." });
+  } catch (err) {
+    console.error("[RECONNECT ERROR]", err.message);
     res.status(500).json({ success: false, message: err.message });
   }
 });
