@@ -856,7 +856,7 @@
         async function checkStatus() {
             if (!isAuthenticated) return;
             try {
-                const res = await fetch('/status');
+                const res = await fetch('/otp-service/status');
                 const data = await res.json();
                 
                 updateStatusElement('statusReady', data.ready);

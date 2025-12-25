@@ -26,9 +26,27 @@ const requireAuth = (req, res, next) => {
 };
 
 // Helper function to register routes with and without /otp-service prefix
-function registerRoute(method, path, handler) {
-  app[method](path, handler);
-  app[method](`/otp-service${path}`, handler);
+function registerRoute(method, path, ...handlers) {
+  // Wrap handlers in try-catch for error handling
+  const wrappedHandlers = handlers.map(handler => {
+    return async (req, res, next) => {
+      try {
+        const result = handler(req, res, next);
+        // If handler returns a promise, wait for it
+        if (result && typeof result.then === 'function') {
+          await result;
+        }
+      } catch (error) {
+        console.error(`[ROUTE ERROR] ${method.toUpperCase()} ${path}:`, error);
+        if (!res.headersSent) {
+          res.status(500).json({ error: error.message || 'Internal server error' });
+        }
+      }
+    };
+  });
+  
+  app[method](path, ...wrappedHandlers);
+  app[method](`/otp-service${path}`, ...wrappedHandlers);
 }
 
 // Login endpoint
@@ -238,6 +256,11 @@ registerRoute("get", "/health", (req, res) => {
   });
 });
 
+// Test route to verify routing works
+registerRoute("get", "/test", (req, res) => {
+  res.json({ message: "Routes are working!", path: req.path, originalUrl: req.originalUrl });
+});
+
 registerRoute("get", "/status", (req, res) => {
   res.json({
     authenticated: isAuthenticated,
@@ -359,6 +382,7 @@ client.initialize().catch(err => {
 
 app.listen(port, "0.0.0.0", () => {
   console.log(`[SERVER] Running on http://0.0.0.0:${port}`);
+  console.log(`[SERVER] Routes registered with /otp-service prefix support`);
 });
 
 process.on("SIGINT", async () => {
