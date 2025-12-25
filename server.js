@@ -161,8 +161,7 @@ function createAndSetupClient(useNewId = false) {
 
   // Authenticated Event - PRIORITY 2
   let authHandler = () => {
-    console.log("[EVENT] ░░░ AUTHENTICATED (NOT WHAT WE WANT) ░░░");
-    console.log("[EVENT] This means old session was reused!");
+    console.log("[EVENT] ░░░ AUTHENTICATED ░░░");
     isAuthenticated = true;
     
     broadcastSSE({ type: 'qr_scanned', message: 'QR scanned' });
@@ -296,7 +295,7 @@ registerRoute("get", "/status", (req, res) => {
   });
 });
 
-// ==================== ULTIMATE QR ENDPOINT ====================
+// ==================== QR ENDPOINT ====================
 registerRoute("get", "/api/qr", requireAuth, async (req, res) => {
   res.set('Cache-Control', 'no-cache, no-store, must-revalidate');
   res.set('Pragma', 'no-cache');
@@ -488,7 +487,7 @@ app.use(express.static(path.join(__dirname, "public")));
 // ==================== STARTUP ====================
 console.log("");
 console.log("╔════════════════════════════════════════════╗");
-console.log("║  WhatsApp OTP - ULTIMATE QR FIX (v1.0)   ║");
+console.log("║  WhatsApp OTP - FIXED READY EVENT (v1.1)  ║");
 console.log("╚════════════════════════════════════════════╝");
 console.log("");
 
