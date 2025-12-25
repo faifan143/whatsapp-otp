@@ -30,12 +30,10 @@ const requireAuth = (req, res, next) => {
 
 // Helper function to register routes with and without /otp-service prefix
 function registerRoute(method, path, ...handlers) {
-  // Wrap handlers in try-catch for error handling
   const wrappedHandlers = handlers.map(handler => {
     return async (req, res, next) => {
       try {
         const result = handler(req, res, next);
-        // If handler returns a promise, wait for it
         if (result && typeof result.then === 'function') {
           await result;
         }
@@ -64,7 +62,7 @@ registerRoute("post", "/api/login", (req, res) => {
   if (email === validEmail && password === validPassword) {
     const sessionId = require("crypto").randomBytes(32).toString("hex");
     sessions.add(sessionId);
-    res.cookie("sessionId", sessionId, { httpOnly: true, maxAge: 24 * 60 * 60 * 1000 }); // 24 hours
+    res.cookie("sessionId", sessionId, { httpOnly: true, maxAge: 24 * 60 * 60 * 1000 });
     res.json({ success: true });
   } else {
     res.status(401).json({ error: "Invalid credentials" });
@@ -79,19 +77,15 @@ registerRoute("get", "/api/auth/check", (req, res) => {
 
 // Server-Sent Events endpoint for real-time updates
 registerRoute("get", "/api/events", requireAuth, (req, res) => {
-  // Set headers for SSE
   res.setHeader('Content-Type', 'text/event-stream');
   res.setHeader('Cache-Control', 'no-cache');
   res.setHeader('Connection', 'keep-alive');
-  res.setHeader('X-Accel-Buffering', 'no'); // Disable nginx buffering
+  res.setHeader('X-Accel-Buffering', 'no');
   
-  // Send initial connection message
   res.write(`data: ${JSON.stringify({ type: 'connected', message: 'Connected to event stream' })}\n\n`);
   
-  // Add client to set
   sseClients.add(res);
   
-  // Send current status
   const statusMessage = JSON.stringify({
     type: 'status',
     data: {
@@ -103,12 +97,10 @@ registerRoute("get", "/api/events", requireAuth, (req, res) => {
   });
   res.write(`data: ${statusMessage}\n\n`);
   
-  // Remove client on disconnect
   req.on('close', () => {
     sseClients.delete(res);
   });
   
-  // Keep connection alive with heartbeat
   const heartbeat = setInterval(() => {
     try {
       res.write(`: heartbeat\n\n`);
@@ -116,9 +108,8 @@ registerRoute("get", "/api/events", requireAuth, (req, res) => {
       clearInterval(heartbeat);
       sseClients.delete(res);
     }
-  }, 30000); // Every 30 seconds
+  }, 30000);
   
-  // Clear interval on disconnect
   req.on('close', () => {
     clearInterval(heartbeat);
   });
@@ -135,7 +126,7 @@ registerRoute("post", "/api/logout", (req, res) => {
 });
 
 let currentQR = null;
-let qrPromiseResolvers = []; // Store all waiting promises
+let qrPromiseResolvers = [];
 
 const AUTH_DIR = "./.wwebjs_auth";
 if (!fs.existsSync(AUTH_DIR)) fs.mkdirSync(AUTH_DIR, { recursive: true });
@@ -143,9 +134,10 @@ if (!fs.existsSync(AUTH_DIR)) fs.mkdirSync(AUTH_DIR, { recursive: true });
 let isAuthenticated = false;
 let isClientReady = false;
 let clientInitialized = false;
+let isManualDisconnect = false;
+let disconnectTimeout = null;
 let client = null;
 
-// Detect system Chromium path for Puppeteer
 const getChromiumPath = () => {
   const possiblePaths = [
     "/usr/bin/chromium-browser",
@@ -158,7 +150,7 @@ const getChromiumPath = () => {
       return chromiumPath;
     }
   }
-  return undefined; // Use bundled Chromium if not found
+  return undefined;
 };
 
 const chromiumPath = getChromiumPath();
@@ -175,7 +167,6 @@ const puppeteerConfig = {
   ],
 };
 
-// Use system Chromium if available
 if (chromiumPath) {
   puppeteerConfig.executablePath = chromiumPath;
 }
@@ -194,11 +185,11 @@ function createClient() {
 client = createClient();
 
 client.on("qr", (qr) => {
+  console.log("[QR EVENT] QR generated");
   if (qr) {
     qrcode.generate(qr, { small: true });
     currentQR = qr;
     
-    // Resolve all waiting promises
     qrPromiseResolvers.forEach(resolve => resolve(qr));
     qrPromiseResolvers = [];
   } else {
@@ -207,7 +198,6 @@ client.on("qr", (qr) => {
   isAuthenticated = false;
   isClientReady = false;
   
-  // Notify all SSE clients that new QR code is available
   const message = JSON.stringify({ 
     type: 'qr_generated', 
     message: 'New QR code generated',
@@ -223,9 +213,9 @@ client.on("qr", (qr) => {
 });
 
 client.on("authenticated", () => {
+  console.log("[CLIENT EVENT] Authenticated");
   isAuthenticated = true;
   
-  // Notify all SSE clients that QR was scanned
   const message = JSON.stringify({ 
     type: 'qr_scanned', 
     message: 'QR code scanned successfully!',
@@ -241,11 +231,11 @@ client.on("authenticated", () => {
 });
 
 client.on("ready", () => {
+  console.log("[CLIENT EVENT] Ready");
   isClientReady = true;
   isAuthenticated = true;
   currentQR = null;
   
-  // Notify all SSE clients that client is ready
   const message = JSON.stringify({ 
     type: 'ready', 
     message: 'WhatsApp client is ready!',
@@ -261,12 +251,12 @@ client.on("ready", () => {
 });
 
 client.on("disconnected", async (reason) => {
+  console.log("[CLIENT EVENT] Disconnected - reason:", reason);
   isAuthenticated = false;
   isClientReady = false;
   currentQR = null;
   clientInitialized = false;
   
-  // Notify all SSE clients that client disconnected
   const message = JSON.stringify({ 
     type: 'disconnected', 
     message: 'WhatsApp client disconnected',
@@ -282,6 +272,7 @@ client.on("disconnected", async (reason) => {
 });
 
 client.on("auth_failure", (msg) => {
+  console.log("[CLIENT EVENT] Auth failure");
   isAuthenticated = false;
   isClientReady = false;
 });
@@ -346,7 +337,6 @@ registerRoute("get", "/health", (req, res) => {
   });
 });
 
-// Test route to verify routing works
 registerRoute("get", "/test", (req, res) => {
   res.json({ message: "Routes are working!", path: req.path, originalUrl: req.originalUrl });
 });
@@ -359,80 +349,113 @@ registerRoute("get", "/status", (req, res) => {
   });
 });
 
-// FIXED: /api/qr endpoint with proper QR waiting logic
+// FIXED QR API ENDPOINT
 registerRoute("get", "/api/qr", requireAuth, async (req, res) => {
-  // Prevent caching
   res.set('Cache-Control', 'no-cache, no-store, must-revalidate');
   res.set('Pragma', 'no-cache');
   res.set('Expires', '0');
   res.set('Content-Type', 'application/json');
   
   try {
-    // If we already have a QR code, return it immediately
+    console.log("[QR API] Request received. Current state:", {
+      hasQR: !!currentQR,
+      qrLength: currentQR ? currentQR.length : 0,
+      isReady: isClientReady,
+      isAuthenticated: isAuthenticated,
+      hasSession: fs.existsSync(path.join(AUTH_DIR, "session-default")),
+      clientInitialized: clientInitialized,
+      isManualDisconnect: isManualDisconnect
+    });
+
+    // If we already have a QR, return it
     if (currentQR) {
-      return res.status(200).json({ 
+      console.log("[QR API] Returning existing QR");
+      return res.json({ 
         qr: currentQR,
         ready: isClientReady,
-        authenticated: isAuthenticated,
-        timestamp: new Date().toISOString()
+        authenticated: isAuthenticated
       });
     }
     
-    // If client is already ready, don't wait for QR (it won't come)
+    // If client is ready, don't wait for QR
     if (isClientReady) {
-      return res.status(200).json({ 
+      console.log("[QR API] Client ready, returning null QR");
+      return res.json({ 
         qr: null,
         ready: true,
-        authenticated: true,
-        timestamp: new Date().toISOString()
+        authenticated: true
       });
     }
     
-    // Check if client needs initialization
     const sessionPath = path.join(AUTH_DIR, "session-default");
     const hasSession = fs.existsSync(sessionPath);
     
-    if (!hasSession && !clientInitialized && !isAuthenticated) {
-      console.log("[QR] No session found, initializing client...");
+    console.log("[QR API] No session:", !hasSession, "Need init:", !clientInitialized);
+    
+    // CRITICAL FIX: Reset disconnect flag if it's been pending for too long (30+ seconds)
+    if (isManualDisconnect && disconnectTimeout) {
+      const timeSinceDisconnect = Date.now() - disconnectTimeout;
+      if (timeSinceDisconnect > 30000) {
+        console.log("[QR API] Disconnect timeout exceeded, resetting isManualDisconnect flag");
+        isManualDisconnect = false;
+        disconnectTimeout = null;
+      }
+    }
+
+    // Initialize client if needed
+    if (!hasSession && !clientInitialized && !isManualDisconnect) {
+      console.log("[QR API] No session and no QR - ensuring client is initialized to generate QR...");
       clientInitialized = true;
       try {
         await client.initialize();
+        console.log("[QR API] Client initialized successfully");
       } catch (err) {
-        console.error("[QR] Client initialization error:", err.message);
+        console.error("[QR API] Client initialization error:", err.message);
         clientInitialized = false;
       }
+    } else if (isManualDisconnect) {
+      console.log("[QR API] Manual disconnect in progress - client will not initialize");
     }
     
-    // Wait for QR code with a timeout (max 10 seconds)
+    // Wait for QR with timeout
     const qrPromise = new Promise((resolve) => {
       qrPromiseResolvers.push(resolve);
-      // Timeout after 10 seconds
-      setTimeout(() => resolve(null), 10000);
+      setTimeout(() => {
+        console.log("[QR API] QR promise timeout");
+        resolve(null);
+      }, 10000);
     });
     
     const qrCode = await qrPromise;
     
-    res.status(200).json({ 
+    console.log("[QR API] Returning QR status:", { hasQR: !!qrCode, qrLength: qrCode ? qrCode.length : 0 });
+    
+    res.json({ 
       qr: qrCode || currentQR || null,
       ready: isClientReady,
-      authenticated: isAuthenticated,
-      timestamp: new Date().toISOString()
+      authenticated: isAuthenticated
     });
   } catch (error) {
-    console.error("[QR] Error:", error.message);
-    res.status(200).json({ 
+    console.error("[QR API] Error:", error.message);
+    res.json({ 
       qr: currentQR || null,
       ready: isClientReady,
       authenticated: isAuthenticated,
-      error: error.message,
-      timestamp: new Date().toISOString()
+      error: error.message
     });
   }
 });
 
+// Disconnect endpoint
 registerRoute("post", "/api/disconnect", requireAuth, async (req, res) => {
   try {
-    // Step 1: Clear all state IMMEDIATELY
+    console.log("[DISCONNECT] Starting disconnect process");
+    
+    // Set manual disconnect flag
+    isManualDisconnect = true;
+    disconnectTimeout = Date.now();
+    
+    // Clear state
     clientInitialized = false;
     currentQR = null;
     isAuthenticated = false;
@@ -442,7 +465,7 @@ registerRoute("post", "/api/disconnect", requireAuth, async (req, res) => {
     qrPromiseResolvers.forEach(resolve => resolve(null));
     qrPromiseResolvers = [];
     
-    // Step 2: Notify all SSE clients IMMEDIATELY
+    // Notify SSE clients
     const disconnectMessage = JSON.stringify({ 
       type: 'disconnected', 
       message: 'WhatsApp disconnected successfully',
@@ -456,38 +479,21 @@ registerRoute("post", "/api/disconnect", requireAuth, async (req, res) => {
       }
     });
     
-    // Step 3: Send immediate status update
-    const statusMessage = JSON.stringify({
-      type: 'status',
-      data: {
-        authenticated: false,
-        ready: false,
-        hasQR: false,
-        timestamp: new Date().toISOString()
-      }
-    });
-    sseClients.forEach(client => {
-      try {
-        client.write(`data: ${statusMessage}\n\n`);
-      } catch (err) {
-        sseClients.delete(client);
-      }
-    });
-    
-    // Step 4: Destroy the client
+    // Destroy client
     try {
       if (client) {
         await client.destroy();
+        console.log("[DISCONNECT] Client destroyed");
       }
     } catch (err) {
-      console.error("Client destroy error:", err.message);
+      console.error("[DISCONNECT] Error destroying client:", err.message);
     }
     
-    // Step 5: Recreate a fresh client for next session
+    // Recreate client
     client = createClient();
-    clientInitialized = false;
+    console.log("[DISCONNECT] Client recreated");
     
-    // Step 6: Aggressively delete session directory
+    // Delete session files
     const sessionPath = path.join(AUTH_DIR, "session-default");
     for (let attempt = 0; attempt < 5; attempt++) {
       try {
@@ -501,23 +507,33 @@ registerRoute("post", "/api/disconnect", requireAuth, async (req, res) => {
           await new Promise(resolve => setTimeout(resolve, 100));
           
           if (!fs.existsSync(sessionPath)) {
+            console.log("[DISCONNECT] Session deleted successfully");
             break;
           }
         } else {
           break;
         }
       } catch (err) {
+        console.error("[DISCONNECT] Error deleting session (attempt " + (attempt+1) + "):", err.message);
         await new Promise(resolve => setTimeout(resolve, 200));
       }
     }
     
+    // Reset disconnect flag after 30 seconds to allow re-initialization
+    console.log("[DISCONNECT] Will reset disconnect flag after 30 seconds");
+    setTimeout(() => {
+      console.log("[DISCONNECT] Resetting isManualDisconnect flag");
+      isManualDisconnect = false;
+      disconnectTimeout = null;
+    }, 30000);
+    
     res.json({ 
       success: true, 
-      message: "Completely disconnected.",
-      wiped: true
+      message: "Completely disconnected."
     });
     
   } catch (err) {
+    console.error("[DISCONNECT] Error:", err.message);
     clientInitialized = false;
     res.status(500).json({ success: false, message: err.message });
   }
@@ -574,15 +590,16 @@ registerRoute("post", "/send-message", requireAuth, async (req, res) => {
   }
 });
 
-// Serve static files from public directory (must be last, after all API routes)
+// Serve static files
 app.use(express.static(path.join(__dirname, "public")));
 
-// Initialize client on server start if no session exists
+// Initialize client on startup
 const initialSessionPath = path.join(AUTH_DIR, "session-default");
 if (!fs.existsSync(initialSessionPath)) {
+  console.log("[STARTUP] No session found, initializing client");
   clientInitialized = true;
   client.initialize().catch(err => {
-    console.error("Initial client initialization error:", err.message);
+    console.error("[STARTUP] Client initialization error:", err.message);
     clientInitialized = false;
   });
 }
