@@ -5,6 +5,7 @@ const { Client, LocalAuth } = require("whatsapp-web.js");
 const qrcode = require("qrcode-terminal");
 const fs = require("fs");
 const path = require("path");
+const crypto = require("crypto");
 
 const app = express();
 const port = process.env.PORT || 3002;
@@ -50,11 +51,9 @@ let isAuthenticated = false;
 let isClientReady = false;
 let qrEventFired = false;
 let client = null;
+let clientId = null;
 
 const AUTH_DIR = "./.wwebjs_auth";
-if (!fs.existsSync(AUTH_DIR)) {
-  fs.mkdirSync(AUTH_DIR, { recursive: true });
-}
 
 // ==================== CHROMIUM ====================
 const getChromiumPath = () => {
@@ -72,7 +71,6 @@ const getChromiumPath = () => {
       return chromiumPath;
     }
   }
-  console.log("[CHROMIUM] Using bundled");
   return undefined;
 };
 
@@ -92,12 +90,50 @@ if (chromiumPath) {
   puppeteerConfig.executablePath = chromiumPath;
 }
 
-// ==================== CLIENT SETUP ====================
-function createAndSetupClient() {
-  console.log("[CLIENT] Creating new client instance");
+// ==================== KILL OLD SESSION ====================
+function cleanupAuthDirectory() {
+  console.log("[CLEANUP] Cleaning auth directory...");
+  
+  if (fs.existsSync(AUTH_DIR)) {
+    try {
+      const files = fs.readdirSync(AUTH_DIR);
+      console.log("[CLEANUP] Found directories:", files);
+      
+      files.forEach(file => {
+        const fullPath = path.join(AUTH_DIR, file);
+        try {
+          fs.rmSync(fullPath, { recursive: true, force: true });
+          console.log("[CLEANUP] Deleted:", file);
+        } catch (err) {
+          console.error("[CLEANUP] Error deleting " + file + ":", err.message);
+        }
+      });
+    } catch (err) {
+      console.error("[CLEANUP] Error reading auth dir:", err.message);
+    }
+  }
+  
+  // Recreate empty directory
+  if (!fs.existsSync(AUTH_DIR)) {
+    fs.mkdirSync(AUTH_DIR, { recursive: true });
+  }
+  
+  console.log("[CLEANUP] Auth directory is now clean");
+}
+
+// ==================== CLIENT FACTORY ====================
+function createAndSetupClient(useNewId = false) {
+  // FORCE NEW CLIENT ID EACH TIME
+  if (useNewId) {
+    clientId = crypto.randomBytes(8).toString('hex');
+  } else if (!clientId) {
+    clientId = 'default';
+  }
+  
+  console.log("[CLIENT] Creating new client with ID:", clientId);
   
   client = new Client({
-    authStrategy: new LocalAuth({ clientId: "default", dataPath: AUTH_DIR }),
+    authStrategy: new LocalAuth({ clientId: clientId, dataPath: AUTH_DIR }),
     puppeteer: puppeteerConfig,
     webVersionCache: {
       type: "remote",
@@ -105,71 +141,65 @@ function createAndSetupClient() {
     },
   });
 
-  // QR Event
-  client.on("qr", (qr) => {
-    console.log("[EVENT] === QR CODE GENERATED ===");
+  // QR Event - PRIORITY 1
+  let qrHandler = (qr) => {
+    console.log("[EVENT] ▓▓▓ QR CODE GENERATED ▓▓▓");
     qrEventFired = true;
+    currentQR = qr || null;
+    
     if (qr) {
       qrcode.generate(qr, { small: true });
-      currentQR = qr;
       console.log("[EVENT] QR length:", qr.length);
-    } else {
-      console.log("[EVENT] QR is null/empty");
-      currentQR = null;
     }
+    
     isAuthenticated = false;
     isClientReady = false;
     
-    broadcastSSE({
-      type: 'qr_generated',
-      message: 'QR code generated'
-    });
-  });
+    broadcastSSE({ type: 'qr_generated', message: 'QR' });
+  };
+  client.on("qr", qrHandler);
 
-  // Authenticated Event
-  client.on("authenticated", () => {
-    console.log("[EVENT] === AUTHENTICATED ===");
+  // Authenticated Event - PRIORITY 2
+  let authHandler = () => {
+    console.log("[EVENT] ░░░ AUTHENTICATED (NOT WHAT WE WANT) ░░░");
+    console.log("[EVENT] This means old session was reused!");
     isAuthenticated = true;
     
-    broadcastSSE({
-      type: 'qr_scanned',
-      message: 'QR scanned'
-    });
-  });
+    broadcastSSE({ type: 'qr_scanned', message: 'QR scanned' });
+  };
+  client.on("authenticated", authHandler);
 
-  // Ready Event
-  client.on("ready", () => {
-    console.log("[EVENT] === READY ===");
+  // Ready Event - PRIORITY 3
+  let readyHandler = () => {
+    console.log("[EVENT] ███ READY ███");
     isClientReady = true;
     isAuthenticated = true;
     currentQR = null;
     
-    broadcastSSE({
-      type: 'ready',
-      message: 'Ready'
-    });
-  });
+    broadcastSSE({ type: 'ready', message: 'Ready' });
+  };
+  client.on("ready", readyHandler);
 
   // Disconnected Event
-  client.on("disconnected", (reason) => {
-    console.log("[EVENT] === DISCONNECTED ===", reason);
+  let disconnectHandler = (reason) => {
+    console.log("[EVENT] DISCONNECTED:", reason);
     isAuthenticated = false;
     isClientReady = false;
     currentQR = null;
     qrEventFired = false;
     
-    broadcastSSE({
-      type: 'disconnected',
-      message: 'Disconnected'
-    });
-  });
+    broadcastSSE({ type: 'disconnected', message: 'Disconnected' });
+  };
+  client.on("disconnected", disconnectHandler);
 
-  client.on("auth_failure", (msg) => {
+  // Auth Failure
+  let failHandler = (msg) => {
     console.log("[EVENT] Auth failure:", msg);
     isAuthenticated = false;
     isClientReady = false;
     qrEventFired = false;
-  });
+  };
+  client.on("auth_failure", failHandler);
 
   return client;
 }
@@ -217,7 +247,6 @@ registerRoute("get", "/api/events", requireAuth, (req, res) => {
   res.setHeader('X-Accel-Buffering', 'no');
   
   res.write(`data: ${JSON.stringify({ type: 'connected' })}\n\n`);
-  
   sseClients.add(res);
   
   const status = {
@@ -263,85 +292,102 @@ registerRoute("get", "/status", (req, res) => {
     ready: isClientReady,
     hasQR: currentQR !== null,
     qrEventFired: qrEventFired,
+    clientId: clientId,
   });
 });
 
-// ==================== QR ENDPOINT - NUCLEAR VERSION ====================
+// ==================== ULTIMATE QR ENDPOINT ====================
 registerRoute("get", "/api/qr", requireAuth, async (req, res) => {
   res.set('Cache-Control', 'no-cache, no-store, must-revalidate');
   res.set('Pragma', 'no-cache');
   res.set('Expires', '0');
   
   try {
-    console.log("[QR REQUEST] ================================================");
-    console.log("[QR REQUEST] hasQR:", !!currentQR);
-    console.log("[QR REQUEST] isReady:", isClientReady);
-    console.log("[QR REQUEST] isAuthenticated:", isAuthenticated);
-    console.log("[QR REQUEST] qrEventFired:", qrEventFired);
+    console.log("\n");
+    console.log("╔════════════════════════════════════════════╗");
+    console.log("║           QR REQUEST RECEIVED              ║");
+    console.log("╚════════════════════════════════════════════╝");
+    console.log("[QR] State: qr=" + (currentQR ? "YES" : "NO") + 
+                " ready=" + isClientReady + 
+                " auth=" + isAuthenticated + 
+                " fired=" + qrEventFired);
     
-    // If ready, no need for QR
+    // If already ready, no QR needed
     if (isClientReady) {
-      console.log("[QR REQUEST] Client ready, returning null");
+      console.log("[QR] Already ready, returning null");
       return res.json({ qr: null, ready: true, authenticated: true });
     }
     
-    // If we have a QR, return it
+    // If we have a QR that actually fired, return it
     if (currentQR && qrEventFired) {
-      console.log("[QR REQUEST] Returning existing QR");
-      return res.json({ qr: currentQR, ready: false, authenticated: isAuthenticated });
+      console.log("[QR] Returning existing QR");
+      return res.json({ qr: currentQR, ready: false, authenticated: false });
     }
     
-    // Initialize if client doesn't exist
-    if (!client) {
-      console.log("[QR REQUEST] No client, creating...");
-      createAndSetupClient();
-    }
+    // NUCLEAR CLEANUP - Delete all old sessions
+    console.log("[QR] Performing nuclear cleanup...");
+    cleanupAuthDirectory();
     
-    // Reset flags for fresh QR
+    // Create fresh client with NEW ID
+    console.log("[QR] Creating fresh client with new ID...");
+    createAndSetupClient(true);
+    
+    // Reset all flags
     qrEventFired = false;
     currentQR = null;
+    isAuthenticated = false;
+    isClientReady = false;
     
-    console.log("[QR REQUEST] Initializing client...");
+    console.log("[QR] Initializing client...");
     
     try {
-      // This will trigger "qr" event if no session, or "authenticated" if session exists
       await client.initialize();
-      console.log("[QR REQUEST] Client initialized");
+      console.log("[QR] Client initialization call completed");
     } catch (err) {
-      console.error("[QR REQUEST] Init error:", err.message);
-      // Continue anyway, event might still fire
+      console.error("[QR] Init error:", err.message);
     }
     
-    // Wait for QR event (20 second timeout)
-    console.log("[QR REQUEST] Waiting for QR event...");
+    // WAIT FOR QR EVENT (not authenticated event!)
+    console.log("[QR] Waiting for QR event (max 25 seconds)...");
     const startTime = Date.now();
     
-    while (Date.now() - startTime < 20000) {
-      if (currentQR && qrEventFired) {
-        console.log("[QR REQUEST] QR received!");
+    while (Date.now() - startTime < 25000) {
+      // Check 1: Did QR event fire?
+      if (qrEventFired && currentQR) {
+        console.log("[QR] ✓ SUCCESS: QR event fired!");
         return res.json({ qr: currentQR, ready: false, authenticated: false });
       }
       
+      // Check 2: Did it become ready? (shouldn't happen but handle it)
       if (isClientReady) {
-        console.log("[QR REQUEST] Client became ready (authenticated)");
+        console.log("[QR] ⚠ Already ready (authenticated from old session)");
         return res.json({ qr: null, ready: true, authenticated: true });
+      }
+      
+      // Check 3: Every 5 seconds, log status
+      if ((Date.now() - startTime) % 5000 < 500) {
+        console.log("[QR] Still waiting... qr=" + qrEventFired + " ready=" + isClientReady);
       }
       
       await new Promise(r => setTimeout(r, 500));
     }
     
-    console.log("[QR REQUEST] Timeout waiting for QR");
+    console.log("[QR] ✗ TIMEOUT: No QR event received after 25 seconds");
+    
+    // If we get here, something went wrong
     res.json({ 
-      qr: currentQR || null, 
-      ready: isClientReady, 
+      qr: currentQR || null,
+      ready: isClientReady,
       authenticated: isAuthenticated,
-      timeout: true
+      fired: qrEventFired,
+      timeout: true,
+      error: "QR event did not fire"
     });
     
   } catch (error) {
-    console.error("[QR REQUEST] ERROR:", error.message);
+    console.error("[QR] FATAL ERROR:", error.message);
     res.json({ 
-      qr: null, 
+      qr: null,
       error: error.message,
       ready: false,
       authenticated: false
@@ -352,35 +398,26 @@ registerRoute("get", "/api/qr", requireAuth, async (req, res) => {
 // ==================== DISCONNECT ====================
 registerRoute("post", "/api/disconnect", requireAuth, async (req, res) => {
   try {
-    console.log("[DISCONNECT] Starting nuclear disconnect");
+    console.log("\n[DISCONNECT] NUCLEAR DISCONNECT INITIATED\n");
     
-    // Reset all state
+    // Kill everything
     currentQR = null;
     isAuthenticated = false;
     isClientReady = false;
     qrEventFired = false;
     
-    // Destroy client
     if (client) {
       try {
         await client.destroy();
         console.log("[DISCONNECT] Client destroyed");
       } catch (err) {
-        console.error("[DISCONNECT] Destroy error:", err.message);
+        console.error("[DISCONNECT] Error:", err.message);
       }
       client = null;
     }
     
-    // Delete session files
-    const sessionPath = path.join(AUTH_DIR, "session-default");
-    if (fs.existsSync(sessionPath)) {
-      try {
-        fs.rmSync(sessionPath, { recursive: true, force: true });
-        console.log("[DISCONNECT] Session files deleted");
-      } catch (err) {
-        console.error("[DISCONNECT] Delete error:", err.message);
-      }
-    }
+    // Delete ALL auth data
+    cleanupAuthDirectory();
     
     broadcastSSE({ type: 'disconnected', message: 'Disconnected' });
     
@@ -451,18 +488,21 @@ app.use(express.static(path.join(__dirname, "public")));
 // ==================== STARTUP ====================
 console.log("");
 console.log("╔════════════════════════════════════════════╗");
-console.log("║     WhatsApp OTP Service - NUCLEAR V2     ║");
+console.log("║  WhatsApp OTP - ULTIMATE QR FIX (v1.0)   ║");
 console.log("╚════════════════════════════════════════════╝");
 console.log("");
-console.log("[STARTUP] Creating initial client...");
-createAndSetupClient();
+
+// Clean on startup
+cleanupAuthDirectory();
+createAndSetupClient(true);
 
 const server = app.listen(port, "0.0.0.0", () => {
   console.log("[STARTUP] Server listening on port " + port);
+  console.log("");
 });
 
 process.on("SIGINT", async () => {
-  console.log("[SHUTDOWN] Shutting down...");
+  console.log("\n[SHUTDOWN] Shutting down gracefully...");
   if (client) {
     try {
       await client.destroy();
