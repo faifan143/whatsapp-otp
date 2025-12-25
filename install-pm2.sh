@@ -126,28 +126,39 @@ else
 fi
 
 echo -e "${YELLOW}Step 7: Installing project dependencies...${NC}"
-npm install --production
+npm install --omit=dev
 
 echo -e "${YELLOW}Step 8: Creating logs directory...${NC}"
 mkdir -p logs
 
 echo -e "${YELLOW}Step 9: Setting up PM2 startup script...${NC}"
-pm2 startup systemd -u root --hp /root
+pm2 startup systemd -u root --hp /root 2>/dev/null || echo -e "${YELLOW}PM2 startup already configured${NC}"
 echo -e "${GREEN}PM2 startup configured${NC}"
+
+echo -e "${YELLOW}Step 10: Starting application with PM2...${NC}"
+# Stop existing instance if running
+pm2 delete whatsapp-otp 2>/dev/null || true
+
+# Start the application
+pm2 start ecosystem.config.js
+
+# Save PM2 process list
+pm2 save
+
+echo -e "${GREEN}Application started with PM2${NC}"
 
 echo ""
 echo -e "${GREEN}=========================================="
 echo "Installation Complete!"
 echo "==========================================${NC}"
 echo ""
-echo "Next steps:"
-echo "1. Start the application: pm2 start ecosystem.config.js"
-echo "2. Save PM2 process list: pm2 save"
-echo "3. Check status: pm2 status"
-echo "4. View logs: pm2 logs whatsapp-otp"
-echo "5. Monitor: pm2 monit"
+echo "Application Status:"
+pm2 status
 echo ""
-echo "To stop Docker container (if running):"
-echo "  docker-compose down"
+echo "Useful commands:"
+echo "  pm2 logs whatsapp-otp    - View logs"
+echo "  pm2 restart whatsapp-otp  - Restart application"
+echo "  pm2 stop whatsapp-otp     - Stop application"
+echo "  pm2 monit                 - Monitor resources"
 echo ""
 
