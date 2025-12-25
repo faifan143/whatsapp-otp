@@ -1088,8 +1088,12 @@
                     document.getElementById('qrContainer').classList.add('hidden');
                     document.getElementById('disconnectBtn').classList.remove('hidden');
                 } else {
-                    // Not ready, show QR if available (debounced)
-                    debouncedCheckQrCode();
+                    // Not ready, show QR if available (debounced with longer delay)
+                    // Only check if enough time has passed since last check
+                    const now = Date.now();
+                    if (now - AppState.lastQrCheck >= 3000) {
+                        debouncedCheckQrCode();
+                    }
                 }
             } catch (error) {
                 if (error.name === 'AbortError') {
@@ -1127,17 +1131,17 @@
             }
         }
 
-        // Debounced QR check to prevent excessive requests
+        // Debounced QR check to prevent excessive requests (increased to 2 seconds)
         const debouncedCheckQrCode = debounce(async () => {
             await checkQrCode();
-        }, 1000);
+        }, 2000);
 
         async function checkQrCode() {
             if (!AppState.isAuthenticated || !AppState.isOnline) return;
             
-            // Prevent checking too frequently
+            // Prevent checking too frequently (increased to 3 seconds to reduce rate limit hits)
             const now = Date.now();
-            if (now - AppState.lastQrCheck < 2000) {
+            if (now - AppState.lastQrCheck < 3000) {
                 return;
             }
             AppState.lastQrCheck = now;
@@ -1152,6 +1156,16 @@
                 });
                 
                 clearTimeout(timeoutId);
+                
+                if (res.status === 429) {
+                    // Rate limit exceeded
+                    const data = await res.json().catch(() => ({}));
+                    const retryAfter = data.retryAfter || 60;
+                    showAlert(`Too many requests. Please wait ${retryAfter} seconds before checking again.`, 'error');
+                    // Don't check again for a while
+                    AppState.lastQrCheck = now + (retryAfter * 1000);
+                    return;
+                }
                 
                 if (!res.ok) {
                     throw new Error(`HTTP ${res.status}`);

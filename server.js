@@ -25,7 +25,7 @@ const RATE_LIMIT_WINDOW = 15 * 60 * 1000; // 15 minutes
 const RATE_LIMIT_MAX_REQUESTS = {
   login: 5,
   api: 100,
-  qr: 10,
+  qr: 30, // Increased from 10 - users may need to check QR multiple times during setup
   message: 50
 };
 
@@ -70,9 +70,17 @@ app.use((req, res, next) => {
 });
 
 // ==================== RATE LIMITING ====================
-const rateLimit = (maxRequests, windowMs) => {
+const rateLimit = (maxRequests, windowMs, useSessionKey = false) => {
   return (req, res, next) => {
-    const key = `${req.ip}:${req.path}`;
+    // For authenticated endpoints, use session ID instead of IP for more lenient limits
+    let key;
+    if (useSessionKey) {
+      const sessionId = req.cookies?.sessionId;
+      key = sessionId ? `session:${sessionId}:${req.path}` : `${req.ip}:${req.path}`;
+    } else {
+      key = `${req.ip}:${req.path}`;
+    }
+    
     const now = Date.now();
     const windowStart = now - windowMs;
     
@@ -82,9 +90,11 @@ const rateLimit = (maxRequests, windowMs) => {
       rateLimitStore.set(key, requests);
       
       if (requests.length >= maxRequests) {
+        const waitTime = Math.ceil((requests[0] + windowMs - now) / 1000);
         return res.status(429).json({
           error: "Too many requests",
-          message: `Rate limit exceeded. Please try again after ${Math.ceil((requests[0] + windowMs - now) / 1000)} seconds.`
+          message: `Rate limit exceeded. Please try again after ${waitTime} seconds.`,
+          retryAfter: waitTime
         });
       }
       
@@ -94,8 +104,8 @@ const rateLimit = (maxRequests, windowMs) => {
       rateLimitStore.set(key, [now]);
     }
     
-    // Cleanup old entries periodically
-    if (Math.random() < 0.01) {
+    // Cleanup old entries periodically (more frequent cleanup)
+    if (Math.random() < 0.05) {
       for (const [k, v] of rateLimitStore.entries()) {
         const filtered = v.filter(time => time > windowStart);
         if (filtered.length === 0) {
@@ -575,7 +585,8 @@ registerRoute("get", "/status", (req, res) => {
 });
 
 // ==================== QR ENDPOINT ====================
-registerRoute("get", "/api/qr", requireAuth, rateLimit(RATE_LIMIT_MAX_REQUESTS.qr, RATE_LIMIT_WINDOW), async (req, res) => {
+// QR endpoint uses session-based rate limiting for authenticated users (more lenient)
+registerRoute("get", "/api/qr", requireAuth, rateLimit(RATE_LIMIT_MAX_REQUESTS.qr, RATE_LIMIT_WINDOW, true), async (req, res) => {
   res.set("Cache-Control", "no-cache, no-store, must-revalidate");
   res.set("Pragma", "no-cache");
   res.set("Expires", "0");
