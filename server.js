@@ -13,7 +13,6 @@ app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 app.use(cookieParser());
 
-// Sessions
 const sessions = new Set();
 const sseClients = new Set();
 
@@ -45,21 +44,19 @@ function registerRoute(method, path, ...handlers) {
   app[method](`/otp-service${path}`, ...wrappedHandlers);
 }
 
-// ==================== STATE MANAGEMENT ====================
+// ==================== STATE ====================
 let currentQR = null;
 let isAuthenticated = false;
 let isClientReady = false;
-let clientInitialized = false;
-let initializationInProgress = false;
-let isManualDisconnect = false;
-let disconnectTimeout = null;
-
-const AUTH_DIR = "./.wwebjs_auth";
-if (!fs.existsSync(AUTH_DIR)) fs.mkdirSync(AUTH_DIR, { recursive: true });
-
+let qrEventFired = false;
 let client = null;
 
-// ==================== CHROMIUM DETECTION ====================
+const AUTH_DIR = "./.wwebjs_auth";
+if (!fs.existsSync(AUTH_DIR)) {
+  fs.mkdirSync(AUTH_DIR, { recursive: true });
+}
+
+// ==================== CHROMIUM ====================
 const getChromiumPath = () => {
   const possiblePaths = [
     "/usr/bin/chromium-browser",
@@ -75,7 +72,7 @@ const getChromiumPath = () => {
       return chromiumPath;
     }
   }
-  console.log("[CHROMIUM] Using bundled Chromium");
+  console.log("[CHROMIUM] Using bundled");
   return undefined;
 };
 
@@ -88,8 +85,6 @@ const puppeteerConfig = {
     "--disable-dev-shm-usage",
     "--disable-gpu",
     "--mute-audio",
-    "--disable-blink-features=AutomationControlled",
-    "--disable-features=IsolateOrigins,site-per-process",
   ],
 };
 
@@ -97,9 +92,11 @@ if (chromiumPath) {
   puppeteerConfig.executablePath = chromiumPath;
 }
 
-// ==================== CLIENT CREATION ====================
-function createClient() {
-  return new Client({
+// ==================== CLIENT SETUP ====================
+function createAndSetupClient() {
+  console.log("[CLIENT] Creating new client instance");
+  
+  client = new Client({
     authStrategy: new LocalAuth({ clientId: "default", dataPath: AUTH_DIR }),
     puppeteer: puppeteerConfig,
     webVersionCache: {
@@ -107,139 +104,81 @@ function createClient() {
       remotePath: "https://raw.githubusercontent.com/wppconnect-team/wa-version/main/html/2.2413.51-beta.html",
     },
   });
-}
 
-function setupClientEvents() {
-  console.log("[CLIENT SETUP] Setting up event handlers");
-  
+  // QR Event
   client.on("qr", (qr) => {
-    console.log("[EVENT] QR Generated");
+    console.log("[EVENT] === QR CODE GENERATED ===");
+    qrEventFired = true;
     if (qr) {
       qrcode.generate(qr, { small: true });
       currentQR = qr;
+      console.log("[EVENT] QR length:", qr.length);
     } else {
+      console.log("[EVENT] QR is null/empty");
       currentQR = null;
     }
     isAuthenticated = false;
     isClientReady = false;
     
-    // Notify SSE
     broadcastSSE({
       type: 'qr_generated',
-      message: 'New QR code generated',
-      timestamp: new Date().toISOString()
+      message: 'QR code generated'
     });
   });
 
+  // Authenticated Event
   client.on("authenticated", () => {
-    console.log("[EVENT] Authenticated");
+    console.log("[EVENT] === AUTHENTICATED ===");
     isAuthenticated = true;
     
     broadcastSSE({
       type: 'qr_scanned',
-      message: 'QR code scanned successfully!',
-      timestamp: new Date().toISOString()
+      message: 'QR scanned'
     });
   });
 
+  // Ready Event
   client.on("ready", () => {
-    console.log("[EVENT] Ready");
+    console.log("[EVENT] === READY ===");
     isClientReady = true;
     isAuthenticated = true;
     currentQR = null;
     
     broadcastSSE({
       type: 'ready',
-      message: 'WhatsApp client is ready!',
-      timestamp: new Date().toISOString()
+      message: 'Ready'
     });
   });
 
-  client.on("disconnected", async (reason) => {
-    console.log("[EVENT] Disconnected - reason:", reason);
+  // Disconnected Event
+  client.on("disconnected", (reason) => {
+    console.log("[EVENT] === DISCONNECTED ===", reason);
     isAuthenticated = false;
     isClientReady = false;
     currentQR = null;
+    qrEventFired = false;
     
     broadcastSSE({
       type: 'disconnected',
-      message: 'WhatsApp client disconnected',
-      timestamp: new Date().toISOString()
+      message: 'Disconnected'
     });
   });
 
   client.on("auth_failure", (msg) => {
-    console.log("[EVENT] Auth failure");
+    console.log("[EVENT] Auth failure:", msg);
     isAuthenticated = false;
     isClientReady = false;
+    qrEventFired = false;
   });
+
+  return client;
 }
 
-// ==================== INITIALIZATION ====================
-async function ensureClientInitialized() {
-  // Prevent concurrent initialization
-  if (initializationInProgress) {
-    console.log("[INIT] Initialization already in progress, waiting...");
-    // Wait for it to complete
-    for (let i = 0; i < 50; i++) {
-      if (!initializationInProgress) break;
-      await new Promise(r => setTimeout(r, 100));
-    }
-    return;
-  }
-
-  if (clientInitialized && client) {
-    console.log("[INIT] Client already initialized");
-    return;
-  }
-
-  if (isManualDisconnect) {
-    console.log("[INIT] Manual disconnect in progress, skipping initialization");
-    return;
-  }
-
-  initializationInProgress = true;
-  
-  try {
-    console.log("[INIT] Starting client initialization...");
-    
-    if (!client) {
-      console.log("[INIT] Creating new client");
-      client = createClient();
-      setupClientEvents();
-    }
-
-    console.log("[INIT] Calling client.initialize()");
-    await client.initialize();
-    
-    clientInitialized = true;
-    console.log("[INIT] Client initialized successfully");
-    
-  } catch (error) {
-    console.error("[INIT] ERROR during initialization:", error.message);
-    clientInitialized = false;
-    
-    // Try to recover by recreating client
-    try {
-      if (client) {
-        await client.destroy().catch(() => {});
-      }
-    } catch (e) {}
-    
-    client = createClient();
-    setupClientEvents();
-    
-  } finally {
-    initializationInProgress = false;
-  }
-}
-
-// ==================== SSE BROADCAST ====================
+// ==================== BROADCAST ====================
 function broadcastSSE(data) {
-  const message = JSON.stringify(data);
   sseClients.forEach(res => {
     try {
-      res.write(`data: ${message}\n\n`);
+      res.write(`data: ${JSON.stringify(data)}\n\n`);
     } catch (err) {
       sseClients.delete(res);
     }
@@ -247,14 +186,13 @@ function broadcastSSE(data) {
 }
 
 // ==================== ROUTES ====================
-
 registerRoute("post", "/api/login", (req, res) => {
   const { email, password } = req.body;
   const validEmail = process.env.LOGIN_EMAIL || "any.otp@gmail.com";
   const validPassword = process.env.LOGIN_PASSWORD;
 
   if (!validPassword) {
-    return res.status(500).json({ error: "Login credentials not configured" });
+    return res.status(500).json({ error: "Login not configured" });
   }
 
   if (email === validEmail && password === validPassword) {
@@ -323,121 +261,104 @@ registerRoute("get", "/status", (req, res) => {
   res.json({
     authenticated: isAuthenticated,
     ready: isClientReady,
-    timestamp: new Date().toISOString(),
+    hasQR: currentQR !== null,
+    qrEventFired: qrEventFired,
   });
 });
 
-registerRoute("get", "/health", (req, res) => {
-  res.json({
-    status: "ok",
-    authenticated: isAuthenticated,
-    ready: isClientReady,
-  });
-});
-
-// ==================== QR CODE ENDPOINT ====================
+// ==================== QR ENDPOINT - NUCLEAR VERSION ====================
 registerRoute("get", "/api/qr", requireAuth, async (req, res) => {
   res.set('Cache-Control', 'no-cache, no-store, must-revalidate');
   res.set('Pragma', 'no-cache');
   res.set('Expires', '0');
   
   try {
-    console.log("[QR] Request received");
-    console.log("[QR] Current state: qr=" + (currentQR ? currentQR.substring(0, 20) + "..." : "null") + 
-                ", ready=" + isClientReady + ", auth=" + isAuthenticated);
+    console.log("[QR REQUEST] ================================================");
+    console.log("[QR REQUEST] hasQR:", !!currentQR);
+    console.log("[QR REQUEST] isReady:", isClientReady);
+    console.log("[QR REQUEST] isAuthenticated:", isAuthenticated);
+    console.log("[QR REQUEST] qrEventFired:", qrEventFired);
     
-    // If client is already ready, no QR needed
+    // If ready, no need for QR
     if (isClientReady) {
-      console.log("[QR] Client ready, returning null");
-      return res.json({ 
-        qr: null,
-        ready: true,
-        authenticated: true
-      });
+      console.log("[QR REQUEST] Client ready, returning null");
+      return res.json({ qr: null, ready: true, authenticated: true });
     }
     
-    // Reset stale disconnect flag
-    if (isManualDisconnect && disconnectTimeout) {
-      const elapsed = Date.now() - disconnectTimeout;
-      if (elapsed > 30000) {
-        console.log("[QR] Resetting stale disconnect flag (elapsed: " + elapsed + "ms)");
-        isManualDisconnect = false;
-        disconnectTimeout = null;
+    // If we have a QR, return it
+    if (currentQR && qrEventFired) {
+      console.log("[QR REQUEST] Returning existing QR");
+      return res.json({ qr: currentQR, ready: false, authenticated: isAuthenticated });
+    }
+    
+    // Initialize if client doesn't exist
+    if (!client) {
+      console.log("[QR REQUEST] No client, creating...");
+      createAndSetupClient();
+    }
+    
+    // Reset flags for fresh QR
+    qrEventFired = false;
+    currentQR = null;
+    
+    console.log("[QR REQUEST] Initializing client...");
+    
+    try {
+      // This will trigger "qr" event if no session, or "authenticated" if session exists
+      await client.initialize();
+      console.log("[QR REQUEST] Client initialized");
+    } catch (err) {
+      console.error("[QR REQUEST] Init error:", err.message);
+      // Continue anyway, event might still fire
+    }
+    
+    // Wait for QR event (20 second timeout)
+    console.log("[QR REQUEST] Waiting for QR event...");
+    const startTime = Date.now();
+    
+    while (Date.now() - startTime < 20000) {
+      if (currentQR && qrEventFired) {
+        console.log("[QR REQUEST] QR received!");
+        return res.json({ qr: currentQR, ready: false, authenticated: false });
       }
+      
+      if (isClientReady) {
+        console.log("[QR REQUEST] Client became ready (authenticated)");
+        return res.json({ qr: null, ready: true, authenticated: true });
+      }
+      
+      await new Promise(r => setTimeout(r, 500));
     }
     
-    // Ensure client is initialized
-    console.log("[QR] Ensuring client initialization...");
-    await ensureClientInitialized();
-    
-    // If we have a QR now, return it
-    if (currentQR) {
-      console.log("[QR] Returning existing QR");
-      return res.json({ 
-        qr: currentQR,
-        ready: isClientReady,
-        authenticated: isAuthenticated
-      });
-    }
-    
-    // Wait for QR with timeout
-    console.log("[QR] Waiting for QR generation (max 15s)");
-    const qrCode = await waitForQR(15000);
-    
-    res.json({
-      qr: qrCode || currentQR || null,
-      ready: isClientReady,
-      authenticated: isAuthenticated
+    console.log("[QR REQUEST] Timeout waiting for QR");
+    res.json({ 
+      qr: currentQR || null, 
+      ready: isClientReady, 
+      authenticated: isAuthenticated,
+      timeout: true
     });
     
   } catch (error) {
-    console.error("[QR] Error:", error.message);
+    console.error("[QR REQUEST] ERROR:", error.message);
     res.json({ 
-      qr: currentQR || null,
-      ready: isClientReady,
-      authenticated: isAuthenticated,
-      error: error.message
+      qr: null, 
+      error: error.message,
+      ready: false,
+      authenticated: false
     });
   }
 });
 
-// Wait for QR code with proper promise handling
-function waitForQR(timeoutMs = 15000) {
-  return new Promise((resolve) => {
-    const checkInterval = setInterval(() => {
-      if (currentQR) {
-        clearInterval(checkInterval);
-        clearTimeout(timeoutTimer);
-        console.log("[QR WAIT] QR received");
-        resolve(currentQR);
-      }
-    }, 500);
-    
-    const timeoutTimer = setTimeout(() => {
-      clearInterval(checkInterval);
-      console.log("[QR WAIT] Timeout after " + timeoutMs + "ms");
-      resolve(null);
-    }, timeoutMs);
-  });
-}
-
 // ==================== DISCONNECT ====================
 registerRoute("post", "/api/disconnect", requireAuth, async (req, res) => {
   try {
-    console.log("[DISCONNECT] Starting disconnect");
+    console.log("[DISCONNECT] Starting nuclear disconnect");
     
-    isManualDisconnect = true;
-    disconnectTimeout = Date.now();
-    clientInitialized = false;
+    // Reset all state
+    currentQR = null;
     isAuthenticated = false;
     isClientReady = false;
-    currentQR = null;
-    
-    broadcastSSE({
-      type: 'disconnected',
-      message: 'WhatsApp disconnected',
-      timestamp: new Date().toISOString()
-    });
+    qrEventFired = false;
     
     // Destroy client
     if (client) {
@@ -445,36 +366,25 @@ registerRoute("post", "/api/disconnect", requireAuth, async (req, res) => {
         await client.destroy();
         console.log("[DISCONNECT] Client destroyed");
       } catch (err) {
-        console.error("[DISCONNECT] Error destroying client:", err.message);
+        console.error("[DISCONNECT] Destroy error:", err.message);
       }
+      client = null;
     }
     
-    // Delete auth files
+    // Delete session files
     const sessionPath = path.join(AUTH_DIR, "session-default");
     if (fs.existsSync(sessionPath)) {
       try {
         fs.rmSync(sessionPath, { recursive: true, force: true });
-        console.log("[DISCONNECT] Session deleted");
+        console.log("[DISCONNECT] Session files deleted");
       } catch (err) {
-        console.error("[DISCONNECT] Error deleting session:", err.message);
+        console.error("[DISCONNECT] Delete error:", err.message);
       }
     }
     
-    // Recreate client for future use
-    client = createClient();
-    setupClientEvents();
+    broadcastSSE({ type: 'disconnected', message: 'Disconnected' });
     
-    // Auto-reset flag after 30 seconds
-    setTimeout(() => {
-      console.log("[DISCONNECT] Auto-resetting disconnect flag");
-      isManualDisconnect = false;
-      disconnectTimeout = null;
-    }, 30000);
-    
-    res.json({ 
-      success: true, 
-      message: "Disconnected successfully"
-    });
+    res.json({ success: true, message: "Disconnected" });
     
   } catch (err) {
     console.error("[DISCONNECT] Error:", err.message);
@@ -483,10 +393,8 @@ registerRoute("post", "/api/disconnect", requireAuth, async (req, res) => {
 });
 
 // ==================== MESSAGING ====================
-function formatPhoneToE164(phone) {
-  let num = phone.toString().trim();
-  if (num.startsWith("+")) num = num.substring(1);
-  num = num.replace(/[^0-9]/g, "");
+function formatPhone(phone) {
+  let num = phone.toString().trim().replace(/[^0-9]/g, "");
   if (num.startsWith("0")) num = "963" + num.substring(1);
   if (num.length < 10) num = "963" + num;
   return num;
@@ -494,118 +402,67 @@ function formatPhoneToE164(phone) {
 
 async function getChatId(phoneNumber) {
   try {
-    const formattedNumber = formatPhoneToE164(phoneNumber);
-    const numberId = await client.getNumberId(formattedNumber);
-    if (numberId) {
-      return numberId._serialized;
-    }
-    return formattedNumber + "@c.us";
-  } catch (err) {
-    const formattedNumber = formatPhoneToE164(phoneNumber);
-    return formattedNumber + "@c.us";
+    const formatted = formatPhone(phoneNumber);
+    const numberId = await client.getNumberId(formatted);
+    return numberId ? numberId._serialized : formatted + "@c.us";
+  } catch {
+    return formatPhone(phoneNumber) + "@c.us";
   }
 }
-
-async function sendMessageWithRetry(phoneNumber, text, maxRetries = 3) {
-  let lastError = null;
-  for (let i = 0; i < maxRetries; i++) {
-    try {
-      if (!isClientReady) {
-        throw new Error("WhatsApp client is not ready");
-      }
-      const chatId = await getChatId(phoneNumber);
-      const result = await client.sendMessage(chatId, text);
-      return result;
-    } catch (err) {
-      lastError = err;
-      if (err.message.includes("LID") || err.message.includes("No LID")) {
-        await new Promise(r => setTimeout(r, 3000));
-      } else if (i < maxRetries - 1) {
-        await new Promise(r => setTimeout(r, 2000));
-      }
-    }
-  }
-  throw lastError;
-}
-
-registerRoute("post", "/send-otp", requireAuth, async (req, res) => {
-  const { phoneNumber, otp } = req.body;
-  if (!phoneNumber || !otp) {
-    return res.status(400).json({
-      success: false,
-      message: "Phone number and OTP required",
-    });
-  }
-  if (!isClientReady) {
-    return res.status(503).json({
-      success: false,
-      message: "WhatsApp not ready",
-    });
-  }
-  try {
-    const msg = `رمز التحقق: ${otp}`;
-    await sendMessageWithRetry(phoneNumber, msg);
-    res.json({ success: true, message: "OTP sent successfully" });
-  } catch (err) {
-    res.status(500).json({
-      success: false,
-      message: "Failed to send OTP: " + err.message,
-    });
-  }
-});
 
 registerRoute("post", "/send-message", requireAuth, async (req, res) => {
   const { phoneNumber, message } = req.body;
   if (!phoneNumber || !message) {
-    return res.status(400).json({
-      success: false,
-      message: "Phone number and message required",
-    });
+    return res.status(400).json({ success: false, message: "Missing params" });
   }
   if (!isClientReady) {
-    return res.status(503).json({
-      success: false,
-      message: "WhatsApp not ready",
-    });
+    return res.status(503).json({ success: false, message: "Not ready" });
   }
   try {
-    await sendMessageWithRetry(phoneNumber, message);
-    res.json({ success: true, message: "Message sent successfully" });
+    const chatId = await getChatId(phoneNumber);
+    await client.sendMessage(chatId, message);
+    res.json({ success: true, message: "Sent" });
   } catch (err) {
-    res.status(500).json({
-      success: false,
-      message: "Failed to send message: " + err.message,
-    });
+    res.status(500).json({ success: false, message: err.message });
   }
 });
 
-// ==================== STATIC FILES ====================
+registerRoute("post", "/send-otp", requireAuth, async (req, res) => {
+  const { phoneNumber, otp } = req.body;
+  if (!phoneNumber || !otp) {
+    return res.status(400).json({ success: false, message: "Missing params" });
+  }
+  if (!isClientReady) {
+    return res.status(503).json({ success: false, message: "Not ready" });
+  }
+  try {
+    const msg = `رمز التحقق: ${otp}`;
+    const chatId = await getChatId(phoneNumber);
+    await client.sendMessage(chatId, msg);
+    res.json({ success: true, message: "Sent" });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// ==================== STATIC ====================
 app.use(express.static(path.join(__dirname, "public")));
 
 // ==================== STARTUP ====================
-async function startup() {
-  console.log("[STARTUP] Server starting on port " + port);
-  
-  // Create initial client
-  client = createClient();
-  setupClientEvents();
-  
-  // Initialize if no session exists
-  const sessionPath = path.join(AUTH_DIR, "session-default");
-  if (!fs.existsSync(sessionPath)) {
-    console.log("[STARTUP] No session found, initializing client");
-    ensureClientInitialized().catch(err => {
-      console.error("[STARTUP] Initialization error:", err.message);
-    });
-  } else {
-    console.log("[STARTUP] Session found, client will initialize on first QR request");
-  }
-}
+console.log("");
+console.log("╔════════════════════════════════════════════╗");
+console.log("║     WhatsApp OTP Service - NUCLEAR V2     ║");
+console.log("╚════════════════════════════════════════════╝");
+console.log("");
+console.log("[STARTUP] Creating initial client...");
+createAndSetupClient();
 
-const server = app.listen(port, "0.0.0.0", startup);
+const server = app.listen(port, "0.0.0.0", () => {
+  console.log("[STARTUP] Server listening on port " + port);
+});
 
 process.on("SIGINT", async () => {
-  console.log("[SHUTDOWN] Shutting down gracefully");
+  console.log("[SHUTDOWN] Shutting down...");
   if (client) {
     try {
       await client.destroy();
