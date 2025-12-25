@@ -387,44 +387,65 @@ registerRoute("get", "/api/qr", requireAuth, (req, res) => {
   res.set('Expires', '0');
   res.set('Content-Type', 'application/json');
   
-  // If no QR code and client is not ready/authenticated, try to initialize if needed
-  if (!currentQR && !isClientReady && !isAuthenticated) {
-    console.log("[QR API] No QR code available, checking if client needs initialization...");
-    
-    const sessionPath = path.join(AUTH_DIR, "session-default");
-    const hasSession = fs.existsSync(sessionPath);
-    
-    console.log("[QR API] Client state:", {
-      hasQR: currentQR !== null,
-      isReady: isClientReady,
-      isAuthenticated: isAuthenticated,
-      hasSession: hasSession
+  const sessionPath = path.join(AUTH_DIR, "session-default");
+  const hasSession = fs.existsSync(sessionPath);
+  
+  console.log("[QR API] Request received. Current state:", {
+    hasQR: currentQR !== null,
+    qrLength: currentQR ? currentQR.length : 0,
+    isReady: isClientReady,
+    isAuthenticated: isAuthenticated,
+    hasSession: hasSession,
+    clientInitialized: clientInitialized,
+    isManualDisconnect: isManualDisconnect
+  });
+  
+  // CRITICAL: WhatsApp Web.js only generates QR codes when there's NO session
+  // If a session exists, it authenticates automatically and skips QR generation
+  // So if we need a QR code, we must ensure there's no session
+  
+  // If client is ready/authenticated, no QR is needed
+  if (isClientReady || isAuthenticated) {
+    console.log("[QR API] Client is ready/authenticated - no QR needed");
+    return res.status(200).json({ 
+      qr: null,
+      ready: isClientReady,
+      authenticated: isAuthenticated,
+      timestamp: new Date().toISOString()
     });
+  }
+  
+  // If session exists but client is not ready, it's authenticating (no QR will be generated)
+  if (hasSession) {
+    console.log("[QR API] Session exists - client will authenticate automatically, no QR will be generated");
+    return res.status(200).json({ 
+      qr: null,
+      ready: false,
+      authenticated: false,
+      message: "Session exists - authenticating automatically. No QR code available.",
+      timestamp: new Date().toISOString()
+    });
+  }
+  
+  // No session exists - QR should be generated
+  if (!hasSession && !currentQR) {
+    console.log("[QR API] No session and no QR - ensuring client is initialized to generate QR...");
     
-    // If no session exists, ensure client is initialized to generate QR
-    if (!hasSession) {
-      console.log("[QR API] No session found - ensuring client is initialized to generate QR...");
-      // Check if client is already initializing by trying to get its state
-      // If not initialized, initialize it
-      try {
-        // The client should already be initialized at server start, but if it failed, try again
-        if (!client.info) {
-          console.log("[QR API] Client not initialized, initializing now...");
-          client.initialize().catch(err => {
-            console.error("[QR API] Failed to initialize client:", err.message);
-          });
-        }
-      } catch (err) {
-        console.error("[QR API] Error checking client state:", err.message);
-      }
+    // Initialize client if not already initialized (will generate QR since no session)
+    if (!clientInitialized && !isManualDisconnect) {
+      console.log("[QR API] Initializing client to generate QR code...");
+      initializeClientIfNeeded();
+    } else if (isManualDisconnect) {
+      console.log("[QR API] Manual disconnect in progress - client will not initialize");
+    } else {
+      console.log("[QR API] Client already initialized, waiting for QR generation...");
     }
   }
   
+  // Return current QR status
   console.log("[QR API] Returning QR status:", {
     hasQR: currentQR !== null,
-    qrLength: currentQR ? currentQR.length : 0,
-    ready: isClientReady,
-    authenticated: isAuthenticated
+    qrLength: currentQR ? currentQR.length : 0
   });
   
   res.status(200).json({ 
@@ -439,6 +460,7 @@ registerRoute("post", "/api/disconnect", requireAuth, async (req, res) => {
   try {
     // Set manual disconnect flag FIRST to prevent auto-reconnect
     isManualDisconnect = true;
+    clientInitialized = false; // Mark as not initialized
     console.log("[DISCONNECT] Manual disconnect initiated, flag set to prevent auto-reconnect");
     
     // Clear state first
@@ -447,29 +469,43 @@ registerRoute("post", "/api/disconnect", requireAuth, async (req, res) => {
     isClientReady = false;
     reconnectAttempts = 0;
     
-    // Delete the session directory BEFORE destroying client to prevent session recreation
+    // Destroy the client FIRST to prevent it from recreating session
+    try {
+      console.log("[DISCONNECT] Destroying client first...");
+      await client.destroy();
+      clientInitialized = false;
+      console.log("[DISCONNECT] Client destroyed successfully");
+      // Wait for cleanup
+      await new Promise(resolve => setTimeout(resolve, 2000));
+    } catch (err) {
+      console.log("[DISCONNECT] Error destroying client (may already be destroyed):", err.message);
+      clientInitialized = false;
+    }
+    
+    // Delete the session directory AFTER destroying client
     const sessionPath = path.join(AUTH_DIR, "session-default");
     if (fs.existsSync(sessionPath)) {
       console.log("[DISCONNECT] Deleting session directory:", sessionPath);
       fs.rmSync(sessionPath, { recursive: true, force: true });
-      console.log("[DISCONNECT] Session directory deleted successfully");
+      console.log("[DISCONNECT] Session directory deleted");
       
-      // Verify deletion
+      // Verify deletion with retries
+      await new Promise(resolve => setTimeout(resolve, 500));
+      let retries = 0;
+      while (fs.existsSync(sessionPath) && retries < 3) {
+        console.log(`[DISCONNECT] Session still exists, retrying deletion (${retries + 1}/3)...`);
+        fs.rmSync(sessionPath, { recursive: true, force: true });
+        await new Promise(resolve => setTimeout(resolve, 500));
+        retries++;
+      }
+      
       if (fs.existsSync(sessionPath)) {
-        console.error("[DISCONNECT] WARNING: Session directory still exists after deletion!");
+        console.error("[DISCONNECT] ERROR: Session directory still exists after multiple deletion attempts!");
       } else {
         console.log("[DISCONNECT] Session directory confirmed deleted");
       }
     } else {
       console.log("[DISCONNECT] No session directory found to delete");
-    }
-    
-    // Destroy the client after session is deleted
-    try {
-      await client.destroy();
-      console.log("[DISCONNECT] Client destroyed successfully");
-    } catch (err) {
-      console.log("[DISCONNECT] Error destroying client (may already be destroyed):", err.message);
     }
     
     // Notify SSE clients about disconnection
@@ -490,6 +526,7 @@ registerRoute("post", "/api/disconnect", requireAuth, async (req, res) => {
   } catch (err) {
     console.error("[DISCONNECT ERROR]", err.message);
     isManualDisconnect = false; // Reset flag on error
+    clientInitialized = false;
     res.status(500).json({ success: false, message: err.message });
   }
 });
@@ -633,15 +670,18 @@ let clientInitialized = false;
 
 function initializeClientIfNeeded() {
   if (clientInitialized || isManualDisconnect) {
+    if (isManualDisconnect) {
+      console.log("[INIT] Skipping initialization - manual disconnect in progress");
+    }
     return;
   }
   
   console.log("[INIT] Starting WhatsApp client initialization...");
   const sessionPath = path.join(AUTH_DIR, "session-default");
   if (fs.existsSync(sessionPath)) {
-    console.log("[INIT] Existing session found, client will try to authenticate automatically");
+    console.log("[INIT] Existing session found, client will try to authenticate automatically (NO QR will be generated)");
   } else {
-    console.log("[INIT] No session found, QR code will be generated");
+    console.log("[INIT] No session found, QR code WILL be generated");
   }
 
   client.initialize().then(() => {
@@ -654,8 +694,12 @@ function initializeClientIfNeeded() {
   });
 }
 
-// Initialize on server start
-initializeClientIfNeeded();
+// Initialize on server start (only if not manually disconnected)
+if (!isManualDisconnect) {
+  initializeClientIfNeeded();
+} else {
+  console.log("[INIT] Server start - skipping initialization due to manual disconnect");
+}
 
 app.listen(port, "0.0.0.0", () => {
   console.log(`[SERVER] Running on http://0.0.0.0:${port}`);
