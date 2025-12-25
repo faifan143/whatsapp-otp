@@ -798,7 +798,9 @@
             lastQrCheck: 0,
             isOnline: navigator.onLine,
             reconnectAttempts: 0,
-            maxReconnectAttempts: 5
+            maxReconnectAttempts: 5,
+            qrRequestInProgress: false,
+            currentQrController: null
         };
 
         // ==================== UTILITY FUNCTIONS ====================
@@ -867,7 +869,8 @@
                     document.getElementById('loginContainer').classList.add('hidden');
                     document.getElementById('mainContent').classList.remove('hidden');
                     startStatusCheck();
-                    checkQrCode(); // Call once on load
+                    // Use debounced version to prevent immediate conflicts
+                    setTimeout(() => debouncedCheckQrCode(), 500);
                     startEventStream();
                 } else {
                     document.getElementById('loginContainer').classList.remove('hidden');
@@ -927,7 +930,8 @@
                         case 'qr_generated':
                             showAlert('New QR code generated. Please scan it with your phone.', 'success');
                             document.getElementById('qrContainer').classList.remove('hidden');
-                            checkQrCode();
+                            // Use debounced version to prevent conflicts
+                            debouncedCheckQrCode();
                             break;
                         
                         case 'disconnected':
@@ -942,7 +946,8 @@
                                 updateStatusElement('statusReady', data.data.ready);
                                 updateStatusElement('statusAuth', data.data.authenticated);
                                 if (data.data.hasQR) {
-                                    checkQrCode();
+                                    // Use debounced version to prevent conflicts
+                                    debouncedCheckQrCode();
                                 }
                             }
                             break;
@@ -1144,11 +1149,23 @@
             if (now - AppState.lastQrCheck < 3000) {
                 return;
             }
+            
+            // If a request is already in progress, cancel it and start a new one
+            if (AppState.qrRequestInProgress && AppState.currentQrController) {
+                AppState.currentQrController.abort();
+                AppState.currentQrController = null;
+            }
+            
+            // Mark that a request is in progress
+            AppState.qrRequestInProgress = true;
             AppState.lastQrCheck = now;
 
             try {
                 const controller = new AbortController();
-                const timeoutId = setTimeout(() => controller.abort(), 30000); // 30s timeout for QR
+                AppState.currentQrController = controller;
+                const timeoutId = setTimeout(() => {
+                    controller.abort();
+                }, 30000); // 30s timeout for QR
                 
                 const res = await fetch('/otp-service/api/qr', {
                     signal: controller.signal,
@@ -1156,6 +1173,8 @@
                 });
                 
                 clearTimeout(timeoutId);
+                AppState.currentQrController = null;
+                AppState.qrRequestInProgress = false;
                 
                 if (res.status === 429) {
                     // Rate limit exceeded
@@ -1163,7 +1182,7 @@
                     const retryAfter = data.retryAfter || 60;
                     showAlert(`Too many requests. Please wait ${retryAfter} seconds before checking again.`, 'error');
                     // Don't check again for a while
-                    AppState.lastQrCheck = now + (retryAfter * 1000);
+                    AppState.lastQrCheck = Date.now() + (retryAfter * 1000);
                     return;
                 }
                 
@@ -1182,10 +1201,19 @@
                     showAlert('QR code generation timed out. Please try again.', 'error');
                 }
             } catch (error) {
+                AppState.currentQrController = null;
+                AppState.qrRequestInProgress = false;
+                
+                // Only show error if it wasn't a manual abort (user triggered new request)
                 if (error.name === 'AbortError') {
-                    showAlert('QR code request timed out', 'error');
+                    // Don't show error for aborted requests - they're expected when new requests come in
+                    return;
                 } else {
                     console.error('QR check error:', error);
+                    // Only show timeout error if it's actually a timeout issue
+                    if (error.message && error.message.includes('timeout')) {
+                        showAlert('QR code request timed out', 'error');
+                    }
                 }
             }
         }
@@ -1462,6 +1490,12 @@
             if (AppState.qrCheckTimeout) {
                 clearTimeout(AppState.qrCheckTimeout);
             }
+            // Cancel any pending QR request
+            if (AppState.currentQrController) {
+                AppState.currentQrController.abort();
+                AppState.currentQrController = null;
+            }
+            AppState.qrRequestInProgress = false;
         });
     </script>
 </body>
