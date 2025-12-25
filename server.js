@@ -1,4 +1,6 @@
+require("dotenv").config();
 const express = require("express");
+const cookieParser = require("cookie-parser");
 const { Client, LocalAuth } = require("whatsapp-web.js");
 const qrcode = require("qrcode-terminal");
 const fs = require("fs");
@@ -8,6 +10,57 @@ const app = express();
 const port = process.env.PORT || 3002;
 
 app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
+app.use(cookieParser());
+
+// Simple session storage (in-memory)
+const sessions = new Set();
+
+// Authentication middleware
+const requireAuth = (req, res, next) => {
+  const sessionId = req.cookies.sessionId;
+  if (sessionId && sessions.has(sessionId)) {
+    return next();
+  }
+  res.status(401).json({ error: 'Unauthorized' });
+};
+
+// Login endpoint
+app.post("/api/login", (req, res) => {
+  const { email, password } = req.body;
+  const validEmail = process.env.LOGIN_EMAIL || "any.otp@gmail.com";
+  const validPassword = process.env.LOGIN_PASSWORD;
+
+  if (!validPassword) {
+    return res.status(500).json({ error: "Login credentials not configured" });
+  }
+
+  if (email === validEmail && password === validPassword) {
+    const sessionId = require("crypto").randomBytes(32).toString("hex");
+    sessions.add(sessionId);
+    res.cookie("sessionId", sessionId, { httpOnly: true, maxAge: 24 * 60 * 60 * 1000 }); // 24 hours
+    res.json({ success: true });
+  } else {
+    res.status(401).json({ error: "Invalid credentials" });
+  }
+});
+
+// Check auth status
+app.get("/api/auth/check", (req, res) => {
+  const sessionId = req.cookies.sessionId;
+  res.json({ authenticated: sessionId && sessions.has(sessionId) });
+});
+
+// Logout endpoint
+app.post("/api/logout", (req, res) => {
+  const sessionId = req.cookies.sessionId;
+  if (sessionId) {
+    sessions.delete(sessionId);
+  }
+  res.clearCookie("sessionId");
+  res.json({ success: true });
+});
+
 // Serve static files from public directory
 app.use(express.static(path.join(__dirname, "public")));
 
@@ -191,7 +244,7 @@ app.get("/status", (req, res) => {
   });
 });
 
-app.get("/api/qr", (req, res) => {
+app.get("/api/qr", requireAuth, (req, res) => {
   // Prevent caching
   res.set('Cache-Control', 'no-cache, no-store, must-revalidate');
   res.set('Pragma', 'no-cache');
@@ -206,7 +259,7 @@ app.get("/api/qr", (req, res) => {
   });
 });
 
-app.post("/api/disconnect", async (req, res) => {
+app.post("/api/disconnect", requireAuth, async (req, res) => {
   try {
     // Destroy the client first
     await client.destroy();
@@ -241,7 +294,7 @@ app.post("/api/disconnect", async (req, res) => {
   }
 });
 
-app.post("/send-otp", async (req, res) => {
+app.post("/send-otp", requireAuth, async (req, res) => {
   const { phoneNumber, otp, purpose } = req.body;
   if (!phoneNumber || !otp) {
     return res.status(400).json({
@@ -268,7 +321,7 @@ app.post("/send-otp", async (req, res) => {
   }
 });
 
-app.post("/send-message", async (req, res) => {
+app.post("/send-message", requireAuth, async (req, res) => {
   const { phoneNumber, message } = req.body;
   if (!phoneNumber || !message) {
     return res.status(400).json({

@@ -106,6 +106,99 @@
             box-shadow: var(--shadow-md);
         }
 
+        /* Login Form Styles */
+        .login-wrapper {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            min-height: 100vh;
+            padding: 20px;
+        }
+
+        .login-card {
+            background: var(--bg);
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            padding: 40px;
+            width: 100%;
+            max-width: 400px;
+            box-shadow: var(--shadow-lg);
+        }
+
+        .login-form {
+            margin-top: 32px;
+        }
+
+        .form-group {
+            margin-bottom: 20px;
+        }
+
+        .form-group label {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            font-size: 13px;
+            font-weight: 600;
+            color: var(--text-secondary);
+            margin-bottom: 8px;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+
+        .form-group label i {
+            font-size: 16px;
+            color: var(--accent);
+        }
+
+        .form-group input {
+            width: 100%;
+            padding: 12px 16px;
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            font-size: 15px;
+            font-family: 'Sora', sans-serif;
+            background: var(--bg);
+            color: var(--text-primary);
+            transition: all 0.2s ease;
+        }
+
+        .form-group input:focus {
+            outline: none;
+            border-color: var(--accent);
+            box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.1);
+        }
+
+        .logout-btn {
+            position: absolute;
+            top: 20px;
+            right: 20px;
+            background: transparent;
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 8px 12px;
+            cursor: pointer;
+            color: var(--text-secondary);
+            font-size: 14px;
+            transition: all 0.2s ease;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+
+        .logout-btn:hover {
+            background: var(--bg-subtle);
+            border-color: var(--accent);
+            color: var(--accent);
+        }
+
+        .header {
+            position: relative;
+        }
+
+        .hidden {
+            display: none !important;
+        }
+
         .card-header {
             font-size: 14px;
             font-weight: 600;
@@ -543,7 +636,37 @@
     </style>
 </head>
 <body>
-    <div class="wrapper">
+    <!-- Login Form -->
+    <div id="loginContainer" class="login-wrapper">
+        <div class="login-card">
+            <div class="header">
+                <div class="logo">
+                    <i class="hgi hgi-whatsapp-01 logo-icon"></i>
+                    <span class="logo-text">Service</span>
+                </div>
+                <h1>WhatsApp OTP</h1>
+                <p class="subtitle">Please login to continue</p>
+            </div>
+            <form id="loginForm" class="login-form">
+                <div class="form-group">
+                    <label for="loginEmail"><i class="hgi hgi-mail"></i> Email</label>
+                    <input type="email" id="loginEmail" name="email" required autocomplete="email" placeholder="Enter your email">
+                </div>
+                <div class="form-group">
+                    <label for="loginPassword"><i class="hgi hgi-lock"></i> Password</label>
+                    <input type="password" id="loginPassword" name="password" required autocomplete="current-password" placeholder="Enter your password">
+                </div>
+                <button type="submit" class="btn btn-primary">
+                    <i class="hgi hgi-log-in"></i>
+                    <span>Login</span>
+                </button>
+            </form>
+            <div id="loginAlert" class="alert"></div>
+        </div>
+    </div>
+
+    <!-- Main Content (hidden until authenticated) -->
+    <div id="mainContent" class="wrapper hidden">
         <div class="header">
             <div class="logo">
                 <i class="hgi hgi-whatsapp-01 logo-icon"></i>
@@ -551,6 +674,9 @@
             </div>
             <h1>WhatsApp OTP</h1>
             <p class="subtitle">Manage connections and send verified messages</p>
+            <button id="logoutBtn" class="logout-btn" title="Logout">
+                <i class="hgi hgi-log-out"></i>
+            </button>
         </div>
 
         <div id="alert" class="alert"></div>
@@ -637,8 +763,85 @@
 
     <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcode.js/1.5.3/qrcode.min.js"></script>
     <script>
-        const API_BASE = '/otp-service';
+        const API_BASE = '';
         let statusInterval, qrInterval;
+        let isAuthenticated = false;
+
+        // Check authentication status on load
+        async function checkAuth() {
+            try {
+                const res = await fetch('/api/auth/check');
+                const data = await res.json();
+                isAuthenticated = data.authenticated;
+                
+                if (isAuthenticated) {
+                    document.getElementById('loginContainer').classList.add('hidden');
+                    document.getElementById('mainContent').classList.remove('hidden');
+                    startStatusCheck();
+                    startQrCheck();
+                } else {
+                    document.getElementById('loginContainer').classList.remove('hidden');
+                    document.getElementById('mainContent').classList.add('hidden');
+                }
+            } catch (error) {
+                console.error('Auth check failed:', error);
+                document.getElementById('loginContainer').classList.remove('hidden');
+                document.getElementById('mainContent').classList.add('hidden');
+            }
+        }
+
+        // Login form handler
+        document.getElementById('loginForm').addEventListener('submit', async (e) => {
+            e.preventDefault();
+            const email = document.getElementById('loginEmail').value;
+            const password = document.getElementById('loginPassword').value;
+            const loginAlert = document.getElementById('loginAlert');
+            const submitBtn = e.target.querySelector('button[type="submit"]');
+            const originalHTML = submitBtn.innerHTML;
+
+            submitBtn.disabled = true;
+            submitBtn.innerHTML = '<i class="hgi hgi-loading-01"></i><span>Logging in...</span>';
+
+            try {
+                const res = await fetch('/api/login', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ email, password })
+                });
+
+                const data = await res.json();
+
+                if (res.ok && data.success) {
+                    loginAlert.className = 'alert show alert-success';
+                    loginAlert.innerHTML = '<span class="alert-icon"><i class="hgi hgi-check-circle-02"></i></span><span>Login successful!</span>';
+                    setTimeout(() => {
+                        checkAuth();
+                    }, 500);
+                } else {
+                    loginAlert.className = 'alert show alert-error';
+                    loginAlert.innerHTML = '<span class="alert-icon"><i class="hgi hgi-alert-circle"></i></span><span>' + (data.error || 'Login failed') + '</span>';
+                }
+            } catch (error) {
+                loginAlert.className = 'alert show alert-error';
+                loginAlert.innerHTML = '<span class="alert-icon"><i class="hgi hgi-alert-circle"></i></span><span>Error: ' + error.message + '</span>';
+            } finally {
+                submitBtn.disabled = false;
+                submitBtn.innerHTML = originalHTML;
+            }
+        });
+
+        // Logout handler
+        document.getElementById('logoutBtn').addEventListener('click', async () => {
+            try {
+                await fetch('/api/logout', { method: 'POST' });
+                isAuthenticated = false;
+                checkAuth();
+                if (statusInterval) clearInterval(statusInterval);
+                if (qrInterval) clearInterval(qrInterval);
+            } catch (error) {
+                console.error('Logout failed:', error);
+            }
+        });
 
         function startStatusCheck() {
             checkStatus();
@@ -651,8 +854,9 @@
         }
 
         async function checkStatus() {
+            if (!isAuthenticated) return;
             try {
-                const res = await fetch('/otp-service/status');
+                const res = await fetch('/status');
                 const data = await res.json();
                 
                 updateStatusElement('statusReady', data.ready);
@@ -694,7 +898,7 @@
         async function checkQrCode() {
             try {
                 console.log('🔍 Checking for QR code...');
-                const res = await fetch('/otp-service/api/qr');
+                const res = await fetch('/api/qr');
                 const data = await res.json();
                 
                 console.log('📦 QR Response:', data);
@@ -761,7 +965,7 @@
 
         async function disconnect() {
             try {
-                const res = await fetch('/otp-service/api/disconnect', { method: 'POST' });
+                const res = await fetch('/api/disconnect', { method: 'POST' });
                 const data = await res.json();
                 
                 if (data.success) {
@@ -803,7 +1007,7 @@
             btn.innerHTML = '<i class="hgi hgi-loading-01"></i><span>Sending</span>';
 
             try {
-                const res = await fetch('/otp-service/send-message', {
+                const res = await fetch('/send-message', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ phoneNumber, message })
@@ -855,8 +1059,8 @@
                 }
             });
 
-            startStatusCheck();
-            startQrCheck();
+            // Check authentication first
+            checkAuth();
             
             console.log('✅ Service ready');
         });
