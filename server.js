@@ -25,8 +25,14 @@ const requireAuth = (req, res, next) => {
   res.status(401).json({ error: 'Unauthorized' });
 };
 
+// Helper function to register routes with and without /otp-service prefix
+function registerRoute(method, path, handler) {
+  app[method](path, handler);
+  app[method](`/otp-service${path}`, handler);
+}
+
 // Login endpoint
-app.post("/api/login", (req, res) => {
+registerRoute("post", "/api/login", (req, res) => {
   const { email, password } = req.body;
   const validEmail = process.env.LOGIN_EMAIL || "any.otp@gmail.com";
   const validPassword = process.env.LOGIN_PASSWORD;
@@ -46,13 +52,13 @@ app.post("/api/login", (req, res) => {
 });
 
 // Check auth status
-app.get("/api/auth/check", (req, res) => {
+registerRoute("get", "/api/auth/check", (req, res) => {
   const sessionId = req.cookies.sessionId;
   res.json({ authenticated: sessionId && sessions.has(sessionId) });
 });
 
 // Logout endpoint
-app.post("/api/logout", (req, res) => {
+registerRoute("post", "/api/logout", (req, res) => {
   const sessionId = req.cookies.sessionId;
   if (sessionId) {
     sessions.delete(sessionId);
@@ -226,7 +232,7 @@ async function sendMessageWithRetry(phoneNumber, text, maxRetries = 3) {
 }
 
 // API Endpoints
-app.get("/health", (req, res) => {
+registerRoute("get", "/health", (req, res) => {
   res.json({
     status: "ok",
     authenticated: isAuthenticated,
@@ -235,7 +241,7 @@ app.get("/health", (req, res) => {
   });
 });
 
-app.get("/status", (req, res) => {
+registerRoute("get", "/status", (req, res) => {
   res.json({
     authenticated: isAuthenticated,
     ready: isClientReady,
@@ -244,7 +250,7 @@ app.get("/status", (req, res) => {
   });
 });
 
-app.get("/api/qr", requireAuth, (req, res) => {
+registerRoute("get", "/api/qr", requireAuth, (req, res) => {
   // Prevent caching
   res.set('Cache-Control', 'no-cache, no-store, must-revalidate');
   res.set('Pragma', 'no-cache');
@@ -259,7 +265,7 @@ app.get("/api/qr", requireAuth, (req, res) => {
   });
 });
 
-app.post("/api/disconnect", requireAuth, async (req, res) => {
+registerRoute("post", "/api/disconnect", requireAuth, async (req, res) => {
   try {
     // Destroy the client first
     await client.destroy();
@@ -294,7 +300,7 @@ app.post("/api/disconnect", requireAuth, async (req, res) => {
   }
 });
 
-app.post("/send-otp", requireAuth, async (req, res) => {
+registerRoute("post", "/send-otp", requireAuth, async (req, res) => {
   const { phoneNumber, otp, purpose } = req.body;
   if (!phoneNumber || !otp) {
     return res.status(400).json({
@@ -321,7 +327,7 @@ app.post("/send-otp", requireAuth, async (req, res) => {
   }
 });
 
-app.post("/send-message", requireAuth, async (req, res) => {
+registerRoute("post", "/send-message", requireAuth, async (req, res) => {
   const { phoneNumber, message } = req.body;
   if (!phoneNumber || !message) {
     return res.status(400).json({
