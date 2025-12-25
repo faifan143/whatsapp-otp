@@ -410,58 +410,104 @@ registerRoute("get", "/api/qr", requireAuth, (req, res) => {
 
 registerRoute("post", "/api/disconnect", requireAuth, async (req, res) => {
   try {
-    // Set manual disconnect flag FIRST to prevent auto-reconnect
+    // Step 1: Set flags to prevent auto-reconnect
     isManualDisconnect = true;
-    clientInitialized = false; // Mark as not initialized
+    clientInitialized = false;
     
-    // Clear state first
+    // Step 2: Clear all state IMMEDIATELY
     currentQR = null;
     isAuthenticated = false;
     isClientReady = false;
     reconnectAttempts = 0;
     
-    // Destroy the client FIRST to prevent it from recreating session
-    try {
-      await client.destroy();
-      clientInitialized = false;
-      // Wait for cleanup
-      await new Promise(resolve => setTimeout(resolve, 2000));
-    } catch (err) {
-      clientInitialized = false;
-    }
-    
-    // Delete the session directory AFTER destroying client
-    const sessionPath = path.join(AUTH_DIR, "session-default");
-    if (fs.existsSync(sessionPath)) {
-      fs.rmSync(sessionPath, { recursive: true, force: true });
-      
-      // Verify deletion with retries
-      await new Promise(resolve => setTimeout(resolve, 500));
-      let retries = 0;
-      while (fs.existsSync(sessionPath) && retries < 3) {
-        fs.rmSync(sessionPath, { recursive: true, force: true });
-        await new Promise(resolve => setTimeout(resolve, 500));
-        retries++;
-      }
-    }
-    
-    // Notify SSE clients about disconnection
-    const message = JSON.stringify({ 
+    // Step 3: Notify all SSE clients IMMEDIATELY
+    const disconnectMessage = JSON.stringify({ 
       type: 'disconnected', 
       message: 'WhatsApp disconnected successfully',
       timestamp: new Date().toISOString()
     });
     sseClients.forEach(client => {
       try {
-        client.write(`data: ${message}\n\n`);
+        client.write(`data: ${disconnectMessage}\n\n`);
       } catch (err) {
-        // Client disconnected
+        sseClients.delete(client);
       }
     });
     
-    res.json({ success: true, message: "Disconnected successfully. Click 'Reconnect' to generate a new QR code." });
+    // Step 4: Send immediate status update
+    const statusMessage = JSON.stringify({
+      type: 'status',
+      data: {
+        authenticated: false,
+        ready: false,
+        hasQR: false,
+        timestamp: new Date().toISOString()
+      }
+    });
+    sseClients.forEach(client => {
+      try {
+        client.write(`data: ${statusMessage}\n\n`);
+      } catch (err) {
+        sseClients.delete(client);
+      }
+    });
+    
+    // Step 5: Destroy the client immediately
+    try {
+      await client.destroy();
+    } catch (err) {
+      // Ignore destroy errors - client may already be destroyed
+    }
+    clientInitialized = false;
+    
+    // Step 6: Aggressively delete session directory with multiple attempts
+    const sessionPath = path.join(AUTH_DIR, "session-default");
+    for (let attempt = 0; attempt < 5; attempt++) {
+      try {
+        if (fs.existsSync(sessionPath)) {
+          fs.rmSync(sessionPath, { 
+            recursive: true, 
+            force: true,
+            maxRetries: 5
+          });
+          
+          await new Promise(resolve => setTimeout(resolve, 100));
+          
+          if (!fs.existsSync(sessionPath)) {
+            break;
+          }
+        } else {
+          break;
+        }
+      } catch (err) {
+        await new Promise(resolve => setTimeout(resolve, 200));
+      }
+    }
+    
+    // Step 7: Delete entire auth directory and recreate it fresh
+    try {
+      if (fs.existsSync(AUTH_DIR)) {
+        fs.rmSync(AUTH_DIR, { recursive: true, force: true });
+        await new Promise(resolve => setTimeout(resolve, 100));
+      }
+      if (!fs.existsSync(AUTH_DIR)) {
+        fs.mkdirSync(AUTH_DIR, { recursive: true });
+      }
+    } catch (err) {
+      // Ignore errors - directory will be recreated on next init
+    }
+    
+    // Step 8: Reset manual disconnect flag for next reconnect
+    isManualDisconnect = false;
+    
+    res.json({ 
+      success: true, 
+      message: "Completely disconnected. Click 'Reconnect' to generate a new QR code.",
+      wiped: true
+    });
+    
   } catch (err) {
-    isManualDisconnect = false; // Reset flag on error
+    isManualDisconnect = false;
     clientInitialized = false;
     res.status(500).json({ success: false, message: err.message });
   }
@@ -470,46 +516,57 @@ registerRoute("post", "/api/disconnect", requireAuth, async (req, res) => {
 // Reconnect endpoint - manually initialize client to generate new QR code
 registerRoute("post", "/api/reconnect", requireAuth, async (req, res) => {
   try {
-    // Reset manual disconnect flag and mark client as needing initialization
+    // Step 1: Reset flags
     isManualDisconnect = false;
     reconnectAttempts = 0;
     clientInitialized = false;
     
-    // Ensure session is deleted before reconnecting (CRITICAL for QR generation)
-    const sessionPath = path.join(AUTH_DIR, "session-default");
-    if (fs.existsSync(sessionPath)) {
-      fs.rmSync(sessionPath, { recursive: true, force: true });
-      // Double-check deletion
-      if (fs.existsSync(sessionPath)) {
-        fs.rmSync(sessionPath, { recursive: true, force: true, maxRetries: 3 });
-      }
-    }
-    
-    // If client is already initialized, destroy it first
-    try {
-      await client.destroy();
-      clientInitialized = false;
-      // Wait for cleanup
-      await new Promise(resolve => setTimeout(resolve, 2000));
-    } catch (err) {
-      clientInitialized = false;
-    }
-    
-    // Clear state
+    // Step 2: Clear state
     currentQR = null;
     isAuthenticated = false;
     isClientReady = false;
     
-    // Initialize client to generate new QR code (no session = will generate QR)
+    // Step 3: Destroy old client completely
+    try {
+      await client.destroy();
+      clientInitialized = false;
+      await new Promise(resolve => setTimeout(resolve, 1000));
+    } catch (err) {
+      clientInitialized = false;
+    }
+    
+    // Step 4: Ensure auth directory is completely clean
+    const sessionPath = path.join(AUTH_DIR, "session-default");
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        if (fs.existsSync(sessionPath)) {
+          fs.rmSync(sessionPath, { recursive: true, force: true, maxRetries: 5 });
+          await new Promise(resolve => setTimeout(resolve, 100));
+        }
+      } catch (err) {
+        await new Promise(resolve => setTimeout(resolve, 200));
+      }
+    }
+    
+    // Step 5: Ensure auth directory exists for fresh start
+    try {
+      if (!fs.existsSync(AUTH_DIR)) {
+        fs.mkdirSync(AUTH_DIR, { recursive: true });
+      }
+    } catch (err) {
+      // Ignore
+    }
+    
+    // Step 6: Initialize fresh client to generate QR
     client.initialize().then(() => {
       clientInitialized = true;
     }).catch(err => {
       clientInitialized = false;
     });
     
-    // Wait for QR to be generated (it's async, can take a few seconds)
+    // Step 7: Wait for QR code to be generated
     let qrGenerated = false;
-    for (let i = 0; i < 20; i++) { // Wait up to 10 seconds
+    for (let i = 0; i < 30; i++) { // Wait up to 15 seconds
       await new Promise(resolve => setTimeout(resolve, 500));
       if (currentQR) {
         qrGenerated = true;
@@ -518,9 +575,18 @@ registerRoute("post", "/api/reconnect", requireAuth, async (req, res) => {
     }
     
     if (qrGenerated) {
-      res.json({ success: true, message: "Reconnected! QR code is ready.", qr: currentQR });
+      res.json({ 
+        success: true, 
+        message: "Reconnected! QR code is ready.", 
+        qr: currentQR,
+        fresh: true 
+      });
     } else {
-      res.json({ success: true, message: "Reconnecting... QR code will appear shortly." });
+      res.json({ 
+        success: true, 
+        message: "Reconnecting... QR code will appear shortly.",
+        fresh: true 
+      });
     }
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });

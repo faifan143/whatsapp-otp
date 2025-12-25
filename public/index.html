@@ -944,15 +944,24 @@
                 const res = await fetch('/otp-service/status');
                 const data = await res.json();
                 
+                // Update UI based on server state
                 updateStatusElement('statusReady', data.ready);
                 updateStatusElement('statusAuth', data.authenticated);
                 
                 document.getElementById('lastUpdate').innerHTML = `<i class="hgi hgi-clock status-icon"></i><span>${new Date(data.timestamp).toLocaleTimeString()}</span>`;
                 
+                // Manage button visibility based on ready state
                 if (!data.ready) {
-                    checkQrCode();
+                    // Not ready, show reconnect button if not already showing
+                    if (!document.getElementById('reconnectBtn').classList.contains('hidden')) {
+                        // Already in reconnect mode, keep QR visible if it exists
+                        checkQrCode();
+                    }
                 } else {
+                    // Ready, show disconnect button
                     document.getElementById('qrContainer').classList.add('hidden');
+                    document.getElementById('disconnectBtn').classList.remove('hidden');
+                    document.getElementById('reconnectBtn').classList.add('hidden');
                 }
             } catch (error) {
                 // Status error
@@ -975,7 +984,13 @@
                 if (elementId === 'statusReady') {
                     elem.innerHTML = '<i class="hgi hgi-alert-circle status-icon"></i><span>Disconnected</span>';
                 } else {
-                    elem.innerHTML = '<i class="hgi hgi-alert-circle status-icon"></i><span>Pending</span>';
+                    // Check if connection is also disconnected
+                    const connectionStatus = document.getElementById('statusReady');
+                    if (connectionStatus && connectionStatus.classList.contains('inactive')) {
+                        elem.innerHTML = '<i class="hgi hgi-alert-circle status-icon"></i><span>Disconnected</span>';
+                    } else {
+                        elem.innerHTML = '<i class="hgi hgi-alert-circle status-icon"></i><span>Pending</span>';
+                    }
                 }
             }
         }
@@ -1036,10 +1051,33 @@
                 const data = await res.json();
                 
                 if (data.success) {
-                    showAlert(data.message || 'Disconnected successfully. Click Reconnect to generate a new QR code.', 'success');
+                    // Step 1: Immediately update status
+                    updateStatusElement('statusReady', false);
+                    updateStatusElement('statusAuth', false);
+                    
+                    // Step 2: Clear all form data
+                    document.getElementById('phoneNumber').value = '';
+                    document.getElementById('message').value = 'Test message from WhatsApp OTP Service';
+                    
+                    // Step 3: Clear QR display
+                    const qrCodeDiv = document.getElementById('qrCode');
+                    if (qrCodeDiv) {
+                        qrCodeDiv.innerHTML = '';
+                    }
+                    document.getElementById('qrContainer').classList.add('hidden');
+                    
+                    // Step 4: Update button visibility
                     document.getElementById('disconnectBtn').classList.add('hidden');
                     document.getElementById('reconnectBtn').classList.remove('hidden');
-                    document.getElementById('qrContainer').classList.add('hidden');
+                    
+                    // Step 5: Clear any previous alerts
+                    const alertEl = document.getElementById('alert');
+                    if (alertEl) {
+                        alertEl.classList.remove('show');
+                    }
+                    
+                    // Step 6: Show success message
+                    showAlert(data.message || 'Completely disconnected and wiped. Click Reconnect to generate a new QR code.', 'success');
                 } else {
                     showAlert('Failed: ' + data.message, 'error');
                 }
