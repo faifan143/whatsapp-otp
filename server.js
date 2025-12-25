@@ -67,9 +67,6 @@ registerRoute("post", "/api/logout", (req, res) => {
   res.json({ success: true });
 });
 
-// Serve static files from public directory
-app.use(express.static(path.join(__dirname, "public")));
-
 let currentQR = null;
 
 const AUTH_DIR = "./.wwebjs_auth";
@@ -352,6 +349,9 @@ registerRoute("post", "/send-message", requireAuth, async (req, res) => {
     });
   }
 });
+
+// Serve static files from public directory (must be last, after all API routes)
+app.use(express.static(path.join(__dirname, "public")));
 
 client.initialize().catch(err => {
   console.error("[INIT ERROR]", err.message);
