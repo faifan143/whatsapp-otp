@@ -232,12 +232,19 @@ const puppeteerConfig = {
     "--disable-gpu",
     "--mute-audio",
     "--disable-extensions",
-    "--disable-plugins"
+    "--disable-plugins",
+    "--disable-background-timer-throttling",
+    "--disable-backgrounding-occluded-windows",
+    "--disable-renderer-backgrounding"
   ]
 };
 
 if (chromiumPath) {
   puppeteerConfig.executablePath = chromiumPath;
+  // For snap chromium, we need additional args
+  if (chromiumPath.includes("/snap/")) {
+    puppeteerConfig.args.push("--disable-features=VizDisplayCompositor");
+  }
 }
 
 // ==================== FILESYSTEM UTILITIES ====================
@@ -341,6 +348,14 @@ const setupClientEventHandlers = () => {
     logger.success("EVENT", "AUTHENTICATED");
     appState.isAuthenticated = true;
     broadcastSSE({ type: "qr_scanned", message: "QR Scanned Successfully" });
+    
+    // The ready event should fire shortly after authenticated
+    // Set a timeout to log if ready doesn't fire within reasonable time
+    setTimeout(() => {
+      if (!appState.isClientReady && appState.isAuthenticated) {
+        logger.warn("EVENT", "Authenticated but ready event not fired yet (waiting...)");
+      }
+    }, 10000); // Check after 10 seconds
   };
   client.on("authenticated", authenticatedHandler);
   handlers.push({ event: "authenticated", handler: authenticatedHandler });
@@ -351,6 +366,16 @@ const setupClientEventHandlers = () => {
     appState.isClientReady = true;
     appState.isAuthenticated = true;
     appState.currentQR = null;
+    
+    // Log client info for debugging
+    try {
+      if (client.info) {
+        logger.info("CLIENT", `Ready - User: ${client.info.pushname || client.info.wid?.user || "Unknown"}`);
+      }
+    } catch (e) {
+      // Ignore errors
+    }
+    
     broadcastSSE({ type: "ready", message: "Client Ready for Messages" });
   };
   client.on("ready", readyHandler);
@@ -570,14 +595,43 @@ registerRoute("get", "/api/events", requireAuth, (req, res) => {
 // ==================== STATUS ENDPOINT ====================
 registerRoute("get", "/status", (req, res) => {
   appState.lastStatusCheck = new Date();
+  
+  // Check client state if it exists - the client.info property is only available when ready
+  let clientInfo = null;
+  let actualReadyState = appState.isClientReady;
+  
+  if (appState.client) {
+    try {
+      // Try to access client.info - if it exists, the client is actually ready
+      const info = appState.client.info;
+      if (info) {
+        clientInfo = {
+          wid: info.wid || null,
+          me: info.me || null,
+          pushname: info.pushname || null
+        };
+        // If info exists but isClientReady is false, update it
+        if (!appState.isClientReady && info.wid) {
+          logger.info("STATUS", "Client has info but isClientReady was false - correcting state");
+          appState.isClientReady = true;
+          appState.isAuthenticated = true;
+          actualReadyState = true;
+        }
+      }
+    } catch (e) {
+      // Ignore errors accessing client info
+    }
+  }
 
   res.json({
     authenticated: appState.isAuthenticated,
-    ready: appState.isClientReady,
+    ready: actualReadyState,
     hasQR: appState.currentQR !== null,
     qrEventFired: appState.qrEventFired,
     clientId: appState.clientId,
     manuallyDisconnected: appState.isManuallyDisconnected,
+    hasClient: appState.client !== null,
+    clientInfo: clientInfo,
     uptime: process.uptime(),
     memoryUsage: process.memoryUsage(),
     timestamp: new Date().toISOString()
@@ -634,16 +688,47 @@ registerRoute("get", "/api/qr", requireAuth, rateLimit(RATE_LIMIT_MAX_REQUESTS.q
     try {
       await appState.client.initialize();
       logger.info("QR", "Client initialization started");
+      
+      // Give it a moment to check if client is already authenticated
+      await new Promise(r => setTimeout(r, 1000));
+      
+      // Check if client is already ready (happens with saved sessions)
+      if (appState.isClientReady) {
+        logger.success("QR", "Client already ready (had saved session)");
+        return res.json({
+          qr: null,
+          ready: true,
+          authenticated: true,
+          message: "Already authenticated and ready"
+        });
+      }
     } catch (err) {
       logger.error("QR", `Init error: ${err.message}`);
+      return res.status(500).json({
+        qr: null,
+        error: `Failed to initialize client: ${err.message}`,
+        ready: false,
+        authenticated: false
+      });
     }
 
-    // Wait for QR event
-    logger.info("QR", "Waiting for QR event (max 25 seconds)...");
+    // Wait for QR event or ready state
+    logger.info("QR", "Waiting for QR event or ready state (max 25 seconds)...");
     const startTime = Date.now();
     let lastLogTime = startTime;
 
     while (Date.now() - startTime < QR_TIMEOUT) {
+      // Check if client became ready (with saved session, ready event fires quickly)
+      if (appState.isClientReady) {
+        logger.success("QR", "Client ready (authenticated from saved session)");
+        return res.json({
+          qr: null,
+          ready: true,
+          authenticated: true,
+          message: "Already authenticated and ready"
+        });
+      }
+      
       // QR received
       if (appState.qrEventFired && appState.currentQR) {
         logger.success("QR", "QR event fired successfully");
@@ -655,21 +740,10 @@ registerRoute("get", "/api/qr", requireAuth, rateLimit(RATE_LIMIT_MAX_REQUESTS.q
         });
       }
 
-      // Already authenticated
-      if (appState.isClientReady) {
-        logger.success("QR", "Already ready (authenticated from saved session)");
-        return res.json({
-          qr: null,
-          ready: true,
-          authenticated: true,
-          message: "Already authenticated"
-        });
-      }
-
       // Log status every 5 seconds
       const now = Date.now();
       if (now - lastLogTime >= STATUS_LOG_INTERVAL) {
-        logger.info("QR", `Waiting... (${Math.round((now - startTime) / 1000)}s elapsed)`);
+        logger.info("QR", `Waiting... (${Math.round((now - startTime) / 1000)}s elapsed, ready: ${appState.isClientReady}, auth: ${appState.isAuthenticated})`);
         lastLogTime = now;
       }
 
