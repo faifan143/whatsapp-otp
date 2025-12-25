@@ -16,6 +16,9 @@ app.use(cookieParser());
 // Simple session storage (in-memory)
 const sessions = new Set();
 
+// SSE clients for real-time updates
+const sseClients = new Set();
+
 // Authentication middleware
 const requireAuth = (req, res, next) => {
   const sessionId = req.cookies.sessionId;
@@ -73,6 +76,54 @@ registerRoute("post", "/api/login", (req, res) => {
 registerRoute("get", "/api/auth/check", (req, res) => {
   const sessionId = req.cookies.sessionId;
   res.json({ authenticated: sessionId && sessions.has(sessionId) });
+});
+
+// Server-Sent Events endpoint for real-time updates
+registerRoute("get", "/api/events", requireAuth, (req, res) => {
+  // Set headers for SSE
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+  res.setHeader('X-Accel-Buffering', 'no'); // Disable nginx buffering
+  
+  // Send initial connection message
+  res.write(`data: ${JSON.stringify({ type: 'connected', message: 'Connected to event stream' })}\n\n`);
+  
+  // Add client to set
+  sseClients.add(res);
+  
+  // Send current status
+  const statusMessage = JSON.stringify({
+    type: 'status',
+    data: {
+      authenticated: isAuthenticated,
+      ready: isClientReady,
+      hasQR: currentQR !== null,
+      timestamp: new Date().toISOString()
+    }
+  });
+  res.write(`data: ${statusMessage}\n\n`);
+  
+  // Remove client on disconnect
+  req.on('close', () => {
+    sseClients.delete(res);
+    console.log('[SSE] Client disconnected, remaining clients:', sseClients.size);
+  });
+  
+  // Keep connection alive with heartbeat
+  const heartbeat = setInterval(() => {
+    try {
+      res.write(`: heartbeat\n\n`);
+    } catch (err) {
+      clearInterval(heartbeat);
+      sseClients.delete(res);
+    }
+  }, 30000); // Every 30 seconds
+  
+  // Clear interval on disconnect
+  req.on('close', () => {
+    clearInterval(heartbeat);
+  });
 });
 
 // Logout endpoint
@@ -147,12 +198,40 @@ client.on("qr", (qr) => {
   isAuthenticated = false;
   isClientReady = false;
   reconnectAttempts = 0;
+  
+  // Notify all SSE clients that new QR code is available
+  const message = JSON.stringify({ 
+    type: 'qr_generated', 
+    message: 'New QR code generated',
+    timestamp: new Date().toISOString()
+  });
+  sseClients.forEach(client => {
+    try {
+      client.write(`data: ${message}\n\n`);
+    } catch (err) {
+      console.error('[SSE] Error sending to client:', err);
+    }
+  });
 });
 
 client.on("authenticated", () => {
-  console.log("[AUTH] WhatsApp authenticated!");
+  console.log("[AUTH] WhatsApp authenticated! QR code scanned successfully!");
   isAuthenticated = true;
   reconnectAttempts = 0;
+  
+  // Notify all SSE clients that QR was scanned
+  const message = JSON.stringify({ 
+    type: 'qr_scanned', 
+    message: 'QR code scanned successfully!',
+    timestamp: new Date().toISOString()
+  });
+  sseClients.forEach(client => {
+    try {
+      client.write(`data: ${message}\n\n`);
+    } catch (err) {
+      console.error('[SSE] Error sending to client:', err);
+    }
+  });
 });
 
 client.on("ready", () => {
@@ -160,7 +239,21 @@ client.on("ready", () => {
   isClientReady = true;
   isAuthenticated = true;
   reconnectAttempts = 0;
-  currentQR = null; 
+  currentQR = null;
+  
+  // Notify all SSE clients that client is ready
+  const message = JSON.stringify({ 
+    type: 'ready', 
+    message: 'WhatsApp client is ready!',
+    timestamp: new Date().toISOString()
+  });
+  sseClients.forEach(client => {
+    try {
+      client.write(`data: ${message}\n\n`);
+    } catch (err) {
+      console.error('[SSE] Error sending to client:', err);
+    }
+  });
 });
 
 client.on("disconnected", async (reason) => {

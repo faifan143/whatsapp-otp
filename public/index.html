@@ -766,6 +766,7 @@
         const API_BASE = '';
         let statusInterval, qrInterval;
         let isAuthenticated = false;
+        let eventSource = null;
 
         // Check authentication status on load
         async function checkAuth() {
@@ -779,14 +780,103 @@
                     document.getElementById('mainContent').classList.remove('hidden');
                     startStatusCheck();
                     startQrCheck();
+                    startEventStream();
                 } else {
                     document.getElementById('loginContainer').classList.remove('hidden');
                     document.getElementById('mainContent').classList.add('hidden');
+                    stopEventStream();
                 }
             } catch (error) {
                 console.error('Auth check failed:', error);
                 document.getElementById('loginContainer').classList.remove('hidden');
                 document.getElementById('mainContent').classList.add('hidden');
+                stopEventStream();
+            }
+        }
+
+        // Start Server-Sent Events stream for real-time updates
+        function startEventStream() {
+            if (eventSource) {
+                return; // Already connected
+            }
+
+            console.log('🔌 Connecting to event stream...');
+            eventSource = new EventSource('/otp-service/api/events');
+
+            eventSource.onopen = () => {
+                console.log('✅ Event stream connected');
+            };
+
+            eventSource.onmessage = (event) => {
+                try {
+                    const data = JSON.parse(event.data);
+                    console.log('📨 Event received:', data);
+
+                    switch (data.type) {
+                        case 'qr_scanned':
+                            console.log('✅ QR code scanned!');
+                            showAlert('QR code scanned successfully! WhatsApp is authenticating...', 'success');
+                            // Update status immediately
+                            updateStatusElement('statusAuth', true);
+                            break;
+                        
+                        case 'ready':
+                            console.log('✅ WhatsApp client is ready!');
+                            showAlert('WhatsApp is ready! You can now send messages.', 'success');
+                            updateStatusElement('statusReady', true);
+                            updateStatusElement('statusAuth', true);
+                            // Hide QR container since we're ready
+                            document.getElementById('qrContainer').classList.add('hidden');
+                            break;
+                        
+                        case 'qr_generated':
+                            console.log('📱 New QR code generated');
+                            showAlert('New QR code generated. Please scan it with your phone.', 'warning');
+                            // Show QR container
+                            document.getElementById('qrContainer').classList.remove('hidden');
+                            // Refresh QR code
+                            checkQrCode();
+                            break;
+                        
+                        case 'status':
+                            // Update status from server
+                            if (data.data) {
+                                updateStatusElement('statusReady', data.data.ready);
+                                updateStatusElement('statusAuth', data.data.authenticated);
+                                if (data.data.hasQR) {
+                                    checkQrCode();
+                                }
+                            }
+                            break;
+                        
+                        case 'connected':
+                            console.log('🔗 Connected to real-time updates');
+                            break;
+                    }
+                } catch (error) {
+                    console.error('Error parsing event data:', error);
+                }
+            };
+
+            eventSource.onerror = (error) => {
+                console.error('❌ Event stream error:', error);
+                // Try to reconnect after 3 seconds
+                setTimeout(() => {
+                    if (eventSource && eventSource.readyState === EventSource.CLOSED) {
+                        console.log('🔄 Reconnecting to event stream...');
+                        stopEventStream();
+                        startEventStream();
+                    }
+                }, 3000);
+            };
+        }
+
+        // Stop event stream
+        function stopEventStream() {
+            if (eventSource) {
+                console.log('🔌 Disconnecting from event stream...');
+                eventSource.close();
+                eventSource = null;
             }
         }
 
@@ -835,9 +925,10 @@
             try {
                 await fetch('/otp-service/api/logout', { method: 'POST' });
                 isAuthenticated = false;
-                checkAuth();
                 if (statusInterval) clearInterval(statusInterval);
                 if (qrInterval) clearInterval(qrInterval);
+                stopEventStream();
+                checkAuth();
             } catch (error) {
                 console.error('Logout failed:', error);
             }
