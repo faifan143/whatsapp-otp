@@ -349,68 +349,14 @@ registerRoute("get", "/status", (req, res) => {
   });
 });
 
-registerRoute("get", "/api/qr", requireAuth, async (req, res) => {
+registerRoute("get", "/api/qr", requireAuth, (req, res) => {
   // Prevent caching
   res.set('Cache-Control', 'no-cache, no-store, must-revalidate');
   res.set('Pragma', 'no-cache');
   res.set('Expires', '0');
   res.set('Content-Type', 'application/json');
   
-  const sessionPath = path.join(AUTH_DIR, "session-default");
-  const hasSession = fs.existsSync(sessionPath);
-  
-  // If client is ready/authenticated, no QR is needed
-  if (isClientReady || isAuthenticated) {
-    return res.status(200).json({ 
-      qr: null,
-      ready: isClientReady,
-      authenticated: isAuthenticated,
-      timestamp: new Date().toISOString()
-    });
-  }
-  
-  // If session exists but client is not ready, it's authenticating (no QR will be generated)
-  if (hasSession) {
-    return res.status(200).json({ 
-      qr: null,
-      ready: false,
-      authenticated: false,
-      message: "Session exists - authenticating automatically. No QR code available.",
-      timestamp: new Date().toISOString()
-    });
-  }
-  
-  // No session exists - ensure QR is generated
-  if (!hasSession && !currentQR) {
-    // Initialize client if not already initialized (will generate QR since no session)
-    if (!clientInitialized) {
-      try {
-        clientInitialized = true;
-        await client.initialize();
-      } catch (err) {
-        clientInitialized = false;
-        // Continue - will return null and frontend can retry
-      }
-    }
-    
-    // Wait up to 15 seconds for QR code to be generated
-    // This handles both newly initialized clients and clients that are already initializing
-    if (clientInitialized) {
-      for (let i = 0; i < 30; i++) {
-        await new Promise(resolve => setTimeout(resolve, 500));
-        if (currentQR) {
-          break;
-        }
-        // If client is no longer initialized, stop waiting
-        if (!clientInitialized) {
-          break;
-        }
-      }
-    }
-  }
-  
-  // Return current QR status
-  // Only return null if client is ready/authenticated, otherwise return QR (may be null if still generating)
+  // Simply return the current QR code status
   res.status(200).json({ 
     qr: currentQR || null,
     ready: isClientReady,
@@ -506,7 +452,7 @@ registerRoute("post", "/api/disconnect", requireAuth, async (req, res) => {
     
     res.json({ 
       success: true, 
-      message: "Completely disconnected. Click 'Reconnect' to generate a new QR code.",
+      message: "Completely disconnected.",
       wiped: true
     });
     
@@ -516,83 +462,6 @@ registerRoute("post", "/api/disconnect", requireAuth, async (req, res) => {
   }
 });
 
-// Reconnect endpoint - manually initialize client to generate new QR code
-registerRoute("post", "/api/reconnect", requireAuth, async (req, res) => {
-  try {
-    // Step 1: Clear state
-    clientInitialized = false;
-    currentQR = null;
-    isAuthenticated = false;
-    isClientReady = false;
-    
-    // Step 2: Destroy old client completely
-    try {
-      await client.destroy();
-      await new Promise(resolve => setTimeout(resolve, 1000));
-    } catch (err) {
-      // Ignore destroy errors
-    }
-    clientInitialized = false;
-    
-    // Step 3: Ensure auth directory is completely clean
-    const sessionPath = path.join(AUTH_DIR, "session-default");
-    for (let attempt = 0; attempt < 3; attempt++) {
-      try {
-        if (fs.existsSync(sessionPath)) {
-          fs.rmSync(sessionPath, { recursive: true, force: true, maxRetries: 5 });
-          await new Promise(resolve => setTimeout(resolve, 100));
-        }
-      } catch (err) {
-        await new Promise(resolve => setTimeout(resolve, 200));
-      }
-    }
-    
-    // Step 4: Ensure auth directory exists for fresh start
-    try {
-      if (!fs.existsSync(AUTH_DIR)) {
-        fs.mkdirSync(AUTH_DIR, { recursive: true });
-      }
-    } catch (err) {
-      // Ignore
-    }
-    
-    // Step 5: Initialize fresh client to generate QR
-    clientInitialized = true;
-    client.initialize().then(() => {
-      // Client initialized successfully
-    }).catch(err => {
-      clientInitialized = false;
-    });
-    
-    // Step 6: Wait for QR code to be generated
-    let qrGenerated = false;
-    for (let i = 0; i < 30; i++) { // Wait up to 15 seconds
-      await new Promise(resolve => setTimeout(resolve, 500));
-      if (currentQR) {
-        qrGenerated = true;
-        break;
-      }
-    }
-    
-    if (qrGenerated) {
-      res.json({ 
-        success: true, 
-        message: "Reconnected! QR code is ready.", 
-        qr: currentQR,
-        fresh: true 
-      });
-    } else {
-      res.json({ 
-        success: true, 
-        message: "Reconnecting... QR code will appear shortly.",
-        fresh: true 
-      });
-    }
-  } catch (err) {
-    clientInitialized = false;
-    res.status(500).json({ success: false, message: err.message });
-  }
-});
 
 registerRoute("post", "/send-otp", requireAuth, async (req, res) => {
   const { phoneNumber, otp, purpose } = req.body;
@@ -647,6 +516,15 @@ registerRoute("post", "/send-message", requireAuth, async (req, res) => {
 
 // Serve static files from public directory (must be last, after all API routes)
 app.use(express.static(path.join(__dirname, "public")));
+
+// Initialize client on server start if no session exists
+const initialSessionPath = path.join(AUTH_DIR, "session-default");
+if (!fs.existsSync(initialSessionPath)) {
+  clientInitialized = true;
+  client.initialize().catch(err => {
+    clientInitialized = false;
+  });
+}
 
 app.listen(port, "0.0.0.0", () => {
   // Server started

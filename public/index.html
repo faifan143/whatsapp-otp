@@ -732,7 +732,6 @@
             <div class="button-group">
                 <button class="btn-primary" onclick="sendTestMessage()"><i class="hgi hgi-send-01"></i> Send Message</button>
                 <button class="btn-danger" onclick="showDisconnectModal()" id="disconnectBtn"><i class="hgi hgi-power-02"></i> Disconnect</button>
-                <button class="btn-primary hidden" onclick="reconnect()" id="reconnectBtn"><i class="hgi hgi-refresh-01"></i> Reconnect</button>
             </div>
         </div>
     </div>
@@ -747,7 +746,7 @@
                 </div>
             </div>
             <p class="modal-message">
-                You will need to scan the QR code again to reconnect. This action cannot be undone immediately.
+                This will disconnect WhatsApp. This action cannot be undone immediately.
             </p>
             <div class="modal-actions">
                 <button class="modal-btn modal-btn-cancel" onclick="closeDisconnectModal()">
@@ -765,7 +764,7 @@
     <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcode.js/1.5.3/qrcode.min.js"></script>
     <script>
         const API_BASE = '';
-        let statusInterval, qrInterval;
+        let statusInterval;
         let isAuthenticated = false;
         let eventSource = null;
 
@@ -780,7 +779,7 @@
                     document.getElementById('loginContainer').classList.add('hidden');
                     document.getElementById('mainContent').classList.remove('hidden');
                     startStatusCheck();
-                    startQrCheck();
+                    checkQrCode(); // Call once on load
                     startEventStream();
                 } else {
                     document.getElementById('loginContainer').classList.remove('hidden');
@@ -822,7 +821,6 @@
                             updateStatusElement('statusAuth', true);
                             document.getElementById('qrContainer').classList.add('hidden');
                             document.getElementById('disconnectBtn').classList.remove('hidden');
-                            document.getElementById('reconnectBtn').classList.add('hidden');
                             break;
                         
                         case 'qr_generated':
@@ -835,8 +833,6 @@
                             showAlert('WhatsApp disconnected successfully.', 'success');
                             updateStatusElement('statusReady', false);
                             updateStatusElement('statusAuth', false);
-                            document.getElementById('disconnectBtn').classList.add('hidden');
-                            document.getElementById('reconnectBtn').classList.remove('hidden');
                             document.getElementById('qrContainer').classList.add('hidden');
                             break;
                         
@@ -856,7 +852,7 @@
             };
 
             eventSource.onerror = (error) => {
-                // Try to reconnect after 3 seconds
+                // Try to restart event stream after 3 seconds
                 setTimeout(() => {
                     if (eventSource && eventSource.readyState === EventSource.CLOSED) {
                         stopEventStream();
@@ -920,7 +916,6 @@
                 await fetch('/otp-service/api/logout', { method: 'POST' });
                 isAuthenticated = false;
                 if (statusInterval) clearInterval(statusInterval);
-                if (qrInterval) clearInterval(qrInterval);
                 stopEventStream();
                 checkAuth();
             } catch (error) {
@@ -931,11 +926,6 @@
         function startStatusCheck() {
             checkStatus();
             statusInterval = setInterval(checkStatus, 2000);
-        }
-
-        function startQrCheck() {
-            checkQrCode();
-            qrInterval = setInterval(checkQrCode, 1000);
         }
 
         async function checkStatus() {
@@ -951,17 +941,13 @@
                 document.getElementById('lastUpdate').innerHTML = `<i class="hgi hgi-clock status-icon"></i><span>${new Date(data.timestamp).toLocaleTimeString()}</span>`;
                 
                 // Manage button visibility based on ready state
-                if (!data.ready) {
-                    // Not ready, show reconnect button if not already showing
-                    if (!document.getElementById('reconnectBtn').classList.contains('hidden')) {
-                        // Already in reconnect mode, keep QR visible if it exists
-                        checkQrCode();
-                    }
-                } else {
-                    // Ready, show disconnect button
+                if (data.ready) {
+                    // Ready, hide QR and show disconnect button
                     document.getElementById('qrContainer').classList.add('hidden');
                     document.getElementById('disconnectBtn').classList.remove('hidden');
-                    document.getElementById('reconnectBtn').classList.add('hidden');
+                } else {
+                    // Not ready, show QR if available
+                    checkQrCode();
                 }
             } catch (error) {
                 // Status error
@@ -1066,18 +1052,14 @@
                     }
                     document.getElementById('qrContainer').classList.add('hidden');
                     
-                    // Step 4: Update button visibility
-                    document.getElementById('disconnectBtn').classList.add('hidden');
-                    document.getElementById('reconnectBtn').classList.remove('hidden');
-                    
-                    // Step 5: Clear any previous alerts
+                    // Step 4: Clear any previous alerts
                     const alertEl = document.getElementById('alert');
                     if (alertEl) {
                         alertEl.classList.remove('show');
                     }
                     
-                    // Step 6: Show success message
-                    showAlert(data.message || 'Completely disconnected and wiped. Click Reconnect to generate a new QR code.', 'success');
+                    // Step 5: Show success message
+                    showAlert(data.message || 'Completely disconnected.', 'success');
                 } else {
                     showAlert('Failed: ' + data.message, 'error');
                 }
@@ -1086,35 +1068,6 @@
             }
         }
 
-        async function reconnect() {
-            try {
-                const btn = document.getElementById('reconnectBtn');
-                const originalHTML = btn.innerHTML;
-                btn.disabled = true;
-                btn.innerHTML = '<i class="hgi hgi-loading-01"></i><span>Reconnecting...</span>';
-
-                const res = await fetch('/otp-service/api/reconnect', { method: 'POST' });
-                const data = await res.json();
-                
-                if (data.success) {
-                    showAlert(data.message || 'Reconnecting... QR code will appear shortly.', 'success');
-                    document.getElementById('qrContainer').classList.remove('hidden');
-                    document.getElementById('reconnectBtn').classList.add('hidden');
-                    document.getElementById('disconnectBtn').classList.remove('hidden');
-                    checkQrCode();
-                } else {
-                    showAlert('Failed: ' + data.message, 'error');
-                }
-                
-                btn.disabled = false;
-                btn.innerHTML = originalHTML;
-            } catch (error) {
-                showAlert('Error: ' + error.message, 'error');
-                const btn = document.getElementById('reconnectBtn');
-                btn.disabled = false;
-                btn.innerHTML = '<i class="hgi hgi-refresh-01"></i><span>Reconnect</span>';
-            }
-        }
 
         function showDisconnectModal() {
             document.getElementById('confirmModal').classList.add('active');
