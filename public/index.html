@@ -1,0 +1,865 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>WhatsApp OTP Service</title>
+    <link href="https://fonts.googleapis.com/css2?family=Sora:wght@400;500;600;700&family=JetBrains+Mono:wght@500&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="https://use.hugeicons.com/font/icons.css">
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        :root {
+            --primary: #0f172a;
+            --secondary: #1e293b;
+            --accent: #3b82f6;
+            --accent-hover: #2563eb;
+            --border: #e2e8f0;
+            --text-primary: #0f172a;
+            --text-secondary: #64748b;
+            --text-tertiary: #94a3b8;
+            --success: #10b981;
+            --error: #ef4444;
+            --warning: #f59e0b;
+            --bg: #ffffff;
+            --bg-subtle: #f8fafc;
+            --shadow-sm: 0 1px 2px 0 rgba(15, 23, 42, 0.05);
+            --shadow-md: 0 4px 6px -1px rgba(15, 23, 42, 0.1);
+            --shadow-lg: 0 10px 15px -3px rgba(15, 23, 42, 0.15);
+        }
+
+        html, body {
+            height: 100%;
+        }
+
+        body {
+            font-family: 'Sora', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+            background: linear-gradient(135deg, #f8fafc 0%, #f1f5f9 100%);
+            color: var(--text-primary);
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 20px;
+        }
+
+        .wrapper {
+            width: 100%;
+            max-width: 700px;
+        }
+
+        .header {
+            margin-bottom: 40px;
+            text-align: center;
+        }
+
+        .logo {
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            margin-bottom: 16px;
+        }
+
+        .logo-icon {
+            font-size: 24px;
+            color: var(--accent);
+        }
+
+        .logo-text {
+            font-size: 13px;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            color: var(--accent);
+        }
+
+        h1 {
+            font-size: 32px;
+            font-weight: 700;
+            color: var(--text-primary);
+            margin-bottom: 8px;
+            letter-spacing: -0.5px;
+        }
+
+        .subtitle {
+            font-size: 15px;
+            color: var(--text-secondary);
+            font-weight: 400;
+        }
+
+        .card {
+            background: var(--bg);
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            padding: 24px;
+            margin-bottom: 20px;
+            box-shadow: var(--shadow-sm);
+            transition: all 0.3s ease;
+        }
+
+        .card:hover {
+            border-color: #cbd5e1;
+            box-shadow: var(--shadow-md);
+        }
+
+        .card-header {
+            font-size: 14px;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            color: var(--text-secondary);
+            margin-bottom: 16px;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .card-header i {
+            font-size: 18px;
+            color: var(--accent);
+        }
+
+        .status-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 16px;
+        }
+
+        .status-item {
+            padding: 16px;
+            background: var(--bg-subtle);
+            border-radius: 8px;
+            border: 1px solid var(--border);
+        }
+
+        .status-label {
+            font-size: 12px;
+            color: var(--text-tertiary);
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            font-weight: 500;
+            margin-bottom: 8px;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+
+        .status-label i {
+            font-size: 14px;
+        }
+
+        .status-value {
+            font-size: 14px;
+            font-weight: 600;
+            color: var(--text-primary);
+            font-family: 'JetBrains Mono', monospace;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+
+        .status-value.active {
+            color: var(--success);
+        }
+
+        .status-value.inactive {
+            color: var(--error);
+        }
+
+        .status-value.pending {
+            color: var(--text-tertiary);
+        }
+
+        .status-icon {
+            font-size: 14px;
+        }
+
+        .qr-section {
+            text-align: center;
+            padding: 32px;
+            background: var(--bg-subtle);
+            border-radius: 8px;
+            border: 1px dashed var(--border);
+            margin-bottom: 0;
+        }
+
+        .qr-section.hidden {
+            display: none;
+        }
+
+        #qrCode {
+            max-width: 220px;
+            margin: 16px auto;
+            padding: 12px;
+            background: white;
+            border-radius: 6px;
+            border: 1px solid var(--border);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            min-height: 250px;
+        }
+
+        #qrCode canvas {
+            max-width: 100%;
+            height: auto;
+        }
+
+        .qr-instruction {
+            font-size: 13px;
+            color: var(--text-secondary);
+            line-height: 1.6;
+            margin-top: 12px;
+        }
+
+        .form-group {
+            margin-bottom: 16px;
+        }
+
+        .form-label {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            font-size: 13px;
+            font-weight: 600;
+            color: var(--text-primary);
+            margin-bottom: 6px;
+            text-transform: uppercase;
+            letter-spacing: 0.3px;
+        }
+
+        .form-label i {
+            font-size: 16px;
+            color: var(--accent);
+        }
+
+        input, textarea {
+            width: 100%;
+            padding: 10px 12px;
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            font-family: 'Sora', sans-serif;
+            font-size: 14px;
+            color: var(--text-primary);
+            background: var(--bg);
+            transition: border-color 0.2s, box-shadow 0.2s;
+        }
+
+        input:focus, textarea:focus {
+            outline: none;
+            border-color: var(--accent);
+            box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.1);
+        }
+
+        textarea {
+            resize: vertical;
+            min-height: 100px;
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 13px;
+        }
+
+        .button-group {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 12px;
+            margin-top: 24px;
+        }
+
+        .button-group.full {
+            grid-template-columns: 1fr;
+        }
+
+        button {
+            padding: 10px 16px;
+            border: none;
+            border-radius: 6px;
+            font-family: 'Sora', sans-serif;
+            font-size: 13px;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.3px;
+            cursor: pointer;
+            transition: all 0.2s ease;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 8px;
+            white-space: nowrap;
+        }
+
+        button i {
+            font-size: 16px;
+        }
+
+        .btn-primary {
+            background: var(--accent);
+            color: white;
+            border: 1px solid var(--accent);
+        }
+
+        .btn-primary:hover:not(:disabled) {
+            background: var(--accent-hover);
+            border-color: var(--accent-hover);
+            box-shadow: var(--shadow-md);
+        }
+
+        .btn-danger {
+            background: transparent;
+            color: var(--error);
+            border: 1px solid #fed7d7;
+        }
+
+        .btn-danger:hover:not(:disabled) {
+            background: #fef2f2;
+            border-color: var(--error);
+        }
+
+        button:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+
+        .alert {
+            padding: 12px 14px;
+            border-radius: 6px;
+            font-size: 13px;
+            margin-bottom: 16px;
+            display: none;
+            align-items: center;
+            gap: 10px;
+            animation: slideIn 0.3s ease;
+        }
+
+        .alert.show {
+            display: flex;
+        }
+
+        .alert-success {
+            background: #ecfdf5;
+            color: #065f46;
+            border: 1px solid #d1fae5;
+        }
+
+        .alert-error {
+            background: #fef2f2;
+            color: #991b1b;
+            border: 1px solid #fee2e2;
+        }
+
+        .alert-icon {
+            font-size: 16px;
+            flex-shrink: 0;
+        }
+
+        .alert-icon i {
+            font-size: 16px;
+        }
+
+        @keyframes slideIn {
+            from {
+                opacity: 0;
+                transform: translateY(-8px);
+            }
+            to {
+                opacity: 1;
+                transform: translateY(0);
+            }
+        }
+
+        .loading-spinner {
+            width: 14px;
+            height: 14px;
+            border: 2px solid rgba(59, 130, 246, 0.2);
+            border-top-color: var(--accent);
+            border-radius: 50%;
+            animation: spin 0.8s linear infinite;
+            display: inline-block;
+        }
+
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+
+        .divider {
+            height: 1px;
+            background: var(--border);
+            margin: 24px 0;
+        }
+
+        .modal-overlay {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: rgba(15, 23, 42, 0.5);
+            display: none;
+            align-items: center;
+            justify-content: center;
+            z-index: 1000;
+            backdrop-filter: blur(4px);
+            animation: fadeIn 0.2s ease;
+        }
+
+        .modal-overlay.active {
+            display: flex;
+        }
+
+        .modal-content {
+            background: var(--bg);
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            padding: 32px;
+            max-width: 420px;
+            width: 100%;
+            box-shadow: var(--shadow-lg);
+            animation: slideUp 0.3s ease;
+        }
+
+        .modal-header {
+            display: flex;
+            align-items: flex-start;
+            gap: 12px;
+            margin-bottom: 16px;
+        }
+
+        .modal-icon {
+            font-size: 24px;
+            color: var(--error);
+            flex-shrink: 0;
+            margin-top: 2px;
+        }
+
+        .modal-title {
+            font-size: 18px;
+            font-weight: 700;
+            color: var(--text-primary);
+            letter-spacing: -0.3px;
+        }
+
+        .modal-message {
+            font-size: 14px;
+            color: var(--text-secondary);
+            line-height: 1.6;
+            margin-bottom: 24px;
+        }
+
+        .modal-actions {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 12px;
+        }
+
+        .modal-btn {
+            padding: 10px 16px;
+            border: none;
+            border-radius: 6px;
+            font-family: 'Sora', sans-serif;
+            font-size: 13px;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.3px;
+            cursor: pointer;
+            transition: all 0.2s ease;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 8px;
+        }
+
+        .modal-btn-confirm {
+            background: var(--error);
+            color: white;
+            border: 1px solid var(--error);
+        }
+
+        .modal-btn-confirm:hover {
+            background: #dc2626;
+            border-color: #dc2626;
+            box-shadow: var(--shadow-md);
+        }
+
+        .modal-btn-cancel {
+            background: var(--bg-subtle);
+            color: var(--text-primary);
+            border: 1px solid var(--border);
+        }
+
+        .modal-btn-cancel:hover {
+            background: #f1f5f9;
+            border-color: #cbd5e1;
+        }
+
+        @keyframes fadeIn {
+            from {
+                opacity: 0;
+            }
+            to {
+                opacity: 1;
+            }
+        }
+
+        @keyframes slideUp {
+            from {
+                opacity: 0;
+                transform: translateY(12px);
+            }
+            to {
+                opacity: 1;
+                transform: translateY(0);
+            }
+        }
+
+        @media (max-width: 600px) {
+            h1 {
+                font-size: 24px;
+            }
+
+            .status-grid {
+                grid-template-columns: 1fr;
+            }
+
+            .button-group {
+                grid-template-columns: 1fr;
+            }
+
+            .card {
+                padding: 16px;
+            }
+
+            .modal-content {
+                margin: 20px;
+                padding: 24px;
+            }
+
+            .modal-actions {
+                grid-template-columns: 1fr;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="wrapper">
+        <div class="header">
+            <div class="logo">
+                <i class="hgi hgi-whatsapp-01 logo-icon"></i>
+                <span class="logo-text">Service</span>
+            </div>
+            <h1>WhatsApp OTP</h1>
+            <p class="subtitle">Manage connections and send verified messages</p>
+        </div>
+
+        <div id="alert" class="alert"></div>
+
+        <div class="card">
+            <div class="card-header"><i class="hgi hgi-dashboard-square"></i> System Status</div>
+            <div class="status-grid">
+                <div class="status-item">
+                    <span class="status-label"><i class="hgi hgi-wifi"></i> Connection</span>
+                    <span class="status-value pending" id="statusReady">
+                        <i class="hgi hgi-loading-01 status-icon"></i>
+                        <span>Checking</span>
+                    </span>
+                </div>
+                <div class="status-item">
+                    <span class="status-label"><i class="hgi hgi-shield-check"></i> Authentication</span>
+                    <span class="status-value pending" id="statusAuth">
+                        <i class="hgi hgi-loading-01 status-icon"></i>
+                        <span>Checking</span>
+                    </span>
+                </div>
+                <div class="status-item">
+                    <span class="status-label"><i class="hgi hgi-clock"></i> Last Update</span>
+                    <span class="status-value" id="lastUpdate">
+                        <i class="hgi hgi-minus"></i>
+                        <span>—</span>
+                    </span>
+                </div>
+            </div>
+        </div>
+
+        <div class="card qr-section hidden" id="qrContainer">
+            <div class="card-header"><i class="hgi hgi-qr-code"></i> Device Linking</div>
+            <div id="qrCode"></div>
+            <p class="qr-instruction">
+                Open WhatsApp on your phone → Settings → Linked Devices → Link a Device. Scan this QR code to authenticate.
+            </p>
+        </div>
+
+        <div class="card">
+            <div class="card-header"><i class="hgi hgi-send-01"></i> Send Message</div>
+            
+            <div class="form-group">
+                <label class="form-label"><i class="hgi hgi-phone"></i> Phone Number</label>
+                <input type="text" id="phoneNumber" placeholder="+1 (555) 123-4567 or local format" />
+            </div>
+
+            <div class="form-group">
+                <label class="form-label"><i class="hgi hgi-message-circle-01"></i> Message</label>
+                <textarea id="message" placeholder="Enter your message...">Test message from WhatsApp OTP Service</textarea>
+            </div>
+
+            <div class="button-group">
+                <button class="btn-primary" onclick="sendTestMessage()"><i class="hgi hgi-send-01"></i> Send Message</button>
+                <button class="btn-danger" onclick="showDisconnectModal()"><i class="hgi hgi-power-02"></i> Disconnect</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Custom Confirmation Modal -->
+    <div class="modal-overlay" id="confirmModal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <i class="hgi hgi-alert-circle modal-icon"></i>
+                <div>
+                    <h2 class="modal-title">Disconnect WhatsApp?</h2>
+                </div>
+            </div>
+            <p class="modal-message">
+                You will need to scan the QR code again to reconnect. This action cannot be undone immediately.
+            </p>
+            <div class="modal-actions">
+                <button class="modal-btn modal-btn-cancel" onclick="closeDisconnectModal()">
+                    <i class="hgi hgi-arrow-left-01"></i>
+                    Cancel
+                </button>
+                <button class="modal-btn modal-btn-confirm" onclick="confirmDisconnect()">
+                    <i class="hgi hgi-power-02"></i>
+                    Disconnect
+                </button>
+            </div>
+        </div>
+    </div>
+
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcode.js/1.5.3/qrcode.min.js"></script>
+    <script>
+        const API_BASE = '/otp-service';
+        let statusInterval, qrInterval;
+
+        function startStatusCheck() {
+            checkStatus();
+            statusInterval = setInterval(checkStatus, 2000);
+        }
+
+        function startQrCheck() {
+            checkQrCode();
+            qrInterval = setInterval(checkQrCode, 1000);
+        }
+
+        async function checkStatus() {
+            try {
+                const res = await fetch('/otp-service/status');
+                const data = await res.json();
+                
+                updateStatusElement('statusReady', data.ready);
+                updateStatusElement('statusAuth', data.authenticated);
+                
+                document.getElementById('lastUpdate').innerHTML = `<i class="hgi hgi-clock status-icon"></i><span>${new Date(data.timestamp).toLocaleTimeString()}</span>`;
+                
+                if (!data.ready) {
+                    checkQrCode();
+                } else {
+                    document.getElementById('qrContainer').classList.add('hidden');
+                }
+            } catch (error) {
+                console.error('Status error:', error);
+            }
+        }
+
+        function updateStatusElement(elementId, isActive) {
+            const elem = document.getElementById(elementId);
+            if (!elem) return;
+            
+            if (isActive) {
+                elem.className = 'status-value active';
+                if (elementId === 'statusReady') {
+                    elem.innerHTML = '<i class="hgi hgi-check-circle-02 status-icon"></i><span>Connected</span>';
+                } else {
+                    elem.innerHTML = '<i class="hgi hgi-check-circle-02 status-icon"></i><span>Authenticated</span>';
+                }
+            } else {
+                elem.className = 'status-value inactive';
+                if (elementId === 'statusReady') {
+                    elem.innerHTML = '<i class="hgi hgi-alert-circle status-icon"></i><span>Disconnected</span>';
+                } else {
+                    elem.innerHTML = '<i class="hgi hgi-alert-circle status-icon"></i><span>Pending</span>';
+                }
+            }
+        }
+
+        async function checkQrCode() {
+            try {
+                console.log('🔍 Checking for QR code...');
+                const res = await fetch('/otp-service/api/qr');
+                const data = await res.json();
+                
+                console.log('📦 QR Response:', data);
+                
+                if (data && data.qr) {
+                    console.log('✅ QR code found!');
+                    displayQRCode(data.qr);
+                } else {
+                    console.log('⏳ No QR code yet');
+                }
+            } catch (error) {
+                console.error('❌ QR fetch error:', error);
+            }
+        }
+
+        function displayQRCode(qrString) {
+            try {
+                const qrContainer = document.getElementById('qrContainer');
+                const qrCodeDiv = document.getElementById('qrCode');
+                
+                if (!qrContainer || !qrCodeDiv) {
+                    console.error('❌ QR elements not found in DOM');
+                    return;
+                }
+                
+                console.log('📍 Showing QR container');
+                qrContainer.classList.remove('hidden');
+                
+                if (!qrString || typeof qrString !== 'string' || qrString.trim() === '') {
+                    console.log('⚠️ Invalid QR string');
+                    qrCodeDiv.innerHTML = '<p style="color: #ef4444; font-size: 13px;">Waiting for QR code...</p>';
+                    return;
+                }
+                
+                console.log('🎨 Generating QR code from string:', qrString.substring(0, 50) + '...');
+                
+                // Clear div
+                qrCodeDiv.innerHTML = '';
+                
+                // Use QR Server API - reliable and no library needed
+                const encodedStr = encodeURIComponent(qrString);
+                const img = document.createElement('img');
+                img.src = `https://api.qrserver.com/v1/create-qr-code/?size=220x220&data=${encodedStr}`;
+                img.alt = 'QR Code';
+                img.style.maxWidth = '100%';
+                img.style.borderRadius = '6px';
+                img.style.display = 'block';
+                img.style.margin = '0 auto';
+                
+                img.onload = () => {
+                    console.log('✅ QR code rendered successfully!');
+                };
+                
+                img.onerror = () => {
+                    console.error('❌ Failed to load QR image');
+                    qrCodeDiv.innerHTML = '<p style="color: #ef4444; font-size: 13px;">Failed to generate QR code</p>';
+                };
+                
+                qrCodeDiv.appendChild(img);
+            } catch (error) {
+                console.error('❌ QR display error:', error);
+            }
+        }
+
+        async function disconnect() {
+            try {
+                const res = await fetch('/otp-service/api/disconnect', { method: 'POST' });
+                const data = await res.json();
+                
+                if (data.success) {
+                    showAlert('Disconnected successfully. Please scan QR code to reconnect.', 'success');
+                    document.getElementById('qrContainer').classList.remove('hidden');
+                } else {
+                    showAlert('Failed: ' + data.message, 'error');
+                }
+            } catch (error) {
+                showAlert('Error: ' + error.message, 'error');
+            }
+        }
+
+        function showDisconnectModal() {
+            document.getElementById('confirmModal').classList.add('active');
+        }
+
+        function closeDisconnectModal() {
+            document.getElementById('confirmModal').classList.remove('active');
+        }
+
+        function confirmDisconnect() {
+            closeDisconnectModal();
+            disconnect();
+        }
+
+        async function sendTestMessage() {
+            const phoneNumber = document.getElementById('phoneNumber').value.trim();
+            const message = document.getElementById('message').value.trim();
+
+            if (!phoneNumber) {
+                showAlert('Please enter a phone number', 'error');
+                return;
+            }
+
+            const btn = event.target.closest('button');
+            const originalHTML = btn.innerHTML;
+            btn.disabled = true;
+            btn.innerHTML = '<i class="hgi hgi-loading-01"></i><span>Sending</span>';
+
+            try {
+                const res = await fetch('/otp-service/send-message', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ phoneNumber, message })
+                });
+
+                const data = await res.json();
+
+                if (data.success) {
+                    showAlert('Message sent successfully!', 'success');
+                    document.getElementById('phoneNumber').value = '';
+                } else {
+                    showAlert('Failed: ' + data.message, 'error');
+                }
+            } catch (error) {
+                showAlert('Error: ' + error.message, 'error');
+            } finally {
+                btn.disabled = false;
+                btn.innerHTML = originalHTML;
+            }
+        }
+
+        function showAlert(message, type) {
+            const alertEl = document.getElementById('alert');
+            const iconMap = { success: 'hgi-check-circle-02', error: 'hgi-alert-circle' };
+            alertEl.innerHTML = `<span class="alert-icon"><i class="hgi ${iconMap[type]}"></i></span><span>${message}</span>`;
+            alertEl.className = `alert show alert-${type}`;
+            setTimeout(() => alertEl.classList.remove('show'), 4000);
+        }
+
+        // Single initialization point
+        document.addEventListener('DOMContentLoaded', () => {
+            console.log('🚀 Initializing WhatsApp OTP Service');
+            
+            const modal = document.getElementById('confirmModal');
+            if (modal) {
+                modal.addEventListener('click', (e) => {
+                    if (e.target === modal) {
+                        closeDisconnectModal();
+                    }
+                });
+            }
+
+            document.addEventListener('keydown', (e) => {
+                if (e.key === 'Escape') {
+                    const modal = document.getElementById('confirmModal');
+                    if (modal && modal.classList.contains('active')) {
+                        closeDisconnectModal();
+                    }
+                }
+            });
+
+            startStatusCheck();
+            startQrCheck();
+            
+            console.log('✅ Service ready');
+        });
+    </script>
+</body>
+</html>

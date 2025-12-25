@@ -28,6 +28,7 @@ COPY package.json ./
 RUN npm install --omit=dev
 
 COPY server.js .
+COPY public ./public
 RUN mkdir -p .wwebjs_auth
 
 EXPOSE 3002
