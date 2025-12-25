@@ -193,12 +193,13 @@ const client = new Client({
 });
 
 client.on("qr", (qr) => {
-  console.log("[QR] Scan this QR code to authenticate:");
+  console.log("[QR] QR code generated! Length:", qr.length);
   qrcode.generate(qr, { small: true });
   currentQR = qr; 
   isAuthenticated = false;
   isClientReady = false;
   reconnectAttempts = 0;
+  console.log("[QR] currentQR set to:", currentQR ? "QR code present" : "null");
   
   // Notify all SSE clients that new QR code is available
   const message = JSON.stringify({ 
@@ -378,6 +379,46 @@ registerRoute("get", "/api/qr", requireAuth, (req, res) => {
   res.set('Expires', '0');
   res.set('Content-Type', 'application/json');
   
+  // If no QR code and client is not ready/authenticated, try to initialize if needed
+  if (!currentQR && !isClientReady && !isAuthenticated) {
+    console.log("[QR API] No QR code available, checking if client needs initialization...");
+    
+    const sessionPath = path.join(AUTH_DIR, "session-default");
+    const hasSession = fs.existsSync(sessionPath);
+    
+    console.log("[QR API] Client state:", {
+      hasQR: currentQR !== null,
+      isReady: isClientReady,
+      isAuthenticated: isAuthenticated,
+      hasSession: hasSession
+    });
+    
+    // If no session exists, ensure client is initialized to generate QR
+    if (!hasSession) {
+      console.log("[QR API] No session found - ensuring client is initialized to generate QR...");
+      // Check if client is already initializing by trying to get its state
+      // If not initialized, initialize it
+      try {
+        // The client should already be initialized at server start, but if it failed, try again
+        if (!client.info) {
+          console.log("[QR API] Client not initialized, initializing now...");
+          client.initialize().catch(err => {
+            console.error("[QR API] Failed to initialize client:", err.message);
+          });
+        }
+      } catch (err) {
+        console.error("[QR API] Error checking client state:", err.message);
+      }
+    }
+  }
+  
+  console.log("[QR API] Returning QR status:", {
+    hasQR: currentQR !== null,
+    qrLength: currentQR ? currentQR.length : 0,
+    ready: isClientReady,
+    authenticated: isAuthenticated
+  });
+  
   res.status(200).json({ 
     qr: currentQR || null,
     ready: isClientReady,
@@ -438,9 +479,12 @@ registerRoute("post", "/api/reconnect", requireAuth, async (req, res) => {
     
     // If client is already initialized, destroy it first
     try {
+      console.log("[RECONNECT] Destroying existing client...");
       await client.destroy();
+      // Wait for cleanup
+      await new Promise(resolve => setTimeout(resolve, 2000));
     } catch (err) {
-      // Ignore errors if client is already destroyed
+      console.log("[RECONNECT] Client already destroyed or error:", err.message);
     }
     
     // Clear state
@@ -448,10 +492,30 @@ registerRoute("post", "/api/reconnect", requireAuth, async (req, res) => {
     isAuthenticated = false;
     isClientReady = false;
     
-    // Initialize client to generate new QR code
-    await client.initialize();
+    console.log("[RECONNECT] Initializing client to generate QR code...");
     
-    res.json({ success: true, message: "Reconnecting... QR code will appear shortly." });
+    // Initialize client to generate new QR code
+    client.initialize().catch(err => {
+      console.error("[RECONNECT INIT ERROR]", err.message);
+    });
+    
+    // Wait a bit for QR to be generated (it's async)
+    let qrGenerated = false;
+    for (let i = 0; i < 10; i++) {
+      await new Promise(resolve => setTimeout(resolve, 500));
+      if (currentQR) {
+        qrGenerated = true;
+        console.log("[RECONNECT] QR code generated successfully!");
+        break;
+      }
+    }
+    
+    if (qrGenerated) {
+      res.json({ success: true, message: "Reconnected! QR code is ready.", qr: currentQR });
+    } else {
+      console.log("[RECONNECT] QR code not generated yet, but initialization started");
+      res.json({ success: true, message: "Reconnecting... QR code will appear shortly." });
+    }
   } catch (err) {
     console.error("[RECONNECT ERROR]", err.message);
     res.status(500).json({ success: false, message: err.message });
@@ -514,8 +578,20 @@ registerRoute("post", "/send-message", requireAuth, async (req, res) => {
 // Serve static files from public directory (must be last, after all API routes)
 app.use(express.static(path.join(__dirname, "public")));
 
-client.initialize().catch(err => {
+// Initialize client on server start
+console.log("[INIT] Starting WhatsApp client initialization...");
+const sessionPath = path.join(AUTH_DIR, "session-default");
+if (fs.existsSync(sessionPath)) {
+  console.log("[INIT] Existing session found, client will try to authenticate automatically");
+} else {
+  console.log("[INIT] No session found, QR code will be generated");
+}
+
+client.initialize().then(() => {
+  console.log("[INIT] Client initialization started successfully");
+}).catch(err => {
   console.error("[INIT ERROR]", err.message);
+  console.error("[INIT ERROR] Stack:", err.stack);
 });
 
 app.listen(port, "0.0.0.0", () => {
