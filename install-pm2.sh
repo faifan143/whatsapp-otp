@@ -23,25 +23,47 @@ echo -e "${YELLOW}Step 1: Updating system packages...${NC}"
 apt-get update -qq
 
 echo -e "${YELLOW}Step 2: Installing required system dependencies...${NC}"
+# Try installing with Ubuntu 24.04+ compatible packages first, fallback to standard names
 apt-get install -y \
     chromium-browser \
     ca-certificates \
     libnss3 \
     libnspr4 \
-    libatk1.0-0 \
-    libatk-bridge2.0-0 \
-    libcups2 \
+    libatk1.0-0t64 \
+    libatk-bridge2.0-0t64 \
+    libcups2t64 \
     libxkbcommon0 \
     libxcomposite1 \
     libxdamage1 \
     libxrandr2 \
     libgbm1 \
-    libgtk-3-0 \
-    libasound2 \
+    libgtk-3-0t64 \
+    libasound2t64 \
     fonts-liberation \
     libappindicator3-1 \
     xdg-utils \
-    --no-install-recommends
+    --no-install-recommends 2>/dev/null || {
+    echo -e "${YELLOW}Some t64 packages not found, trying standard package names...${NC}"
+    apt-get install -y \
+        chromium-browser \
+        ca-certificates \
+        libnss3 \
+        libnspr4 \
+        libatk1.0-0 \
+        libatk-bridge2.0-0 \
+        libcups2 \
+        libxkbcommon0 \
+        libxcomposite1 \
+        libxdamage1 \
+        libxrandr2 \
+        libgbm1 \
+        libgtk-3-0 \
+        libasound2t64 \
+        fonts-liberation \
+        libappindicator3-1 \
+        xdg-utils \
+        --no-install-recommends
+}
 
 echo -e "${YELLOW}Step 3: Checking Node.js version...${NC}"
 NODE_VERSION=$(node -v | cut -d'v' -f2 | cut -d'.' -f1)
