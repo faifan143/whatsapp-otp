@@ -190,7 +190,8 @@ const appState = {
   isManuallyDisconnected: false,
   lastQRRequest: null,
   lastStatusCheck: null,
-  messageQueue: []
+  messageQueue: [],
+  readyCheckInterval: null
 };
 
 // ==================== LOGGER ====================
@@ -494,10 +495,65 @@ const setupClientEventHandlers = () => {
     logger.success("EVENT", "AUTHENTICATED");
     appState.isAuthenticated = true;
     broadcastSSE({ type: "qr_scanned", message: "QR Scanned Successfully" });
-    // Ready event should fire automatically after authenticated
+    
+    // Start periodic ready check in case ready event doesn't fire
+    startReadyCheck();
+    
+    // Also check immediately after a short delay
+    setTimeout(async () => {
+      try {
+        // Check if client.info is available (indicates ready state)
+        if (client.info && client.info.wid) {
+          logger.info("CLIENT", "Client appears ready after authentication check");
+          if (!appState.isClientReady) {
+            // Manually trigger ready state if client is actually ready
+            logger.warn("CLIENT", "Ready event didn't fire, but client appears ready - manually setting state");
+            appState.isClientReady = true;
+            appState.currentQR = null;
+            stopReadyCheck(); // Stop the interval since we're ready
+            broadcastSSE({ type: "ready", message: "Client Ready for Messages" });
+          }
+        } else {
+          logger.info("CLIENT", "Client authenticated but not yet ready, waiting for ready event...");
+        }
+      } catch (e) {
+        logger.warn("CLIENT", `Error checking client state: ${e.message}`);
+      }
+    }, 3000); // Check after 3 seconds
   };
   client.on("authenticated", authenticatedHandler);
   handlers.push({ event: "authenticated", handler: authenticatedHandler });
+  
+  // Change State Event - track state changes
+  const changeStateHandler = (state) => {
+    logger.info("EVENT", `State changed: ${state}`);
+    // If state is "CONNECTED", client should be ready
+    if (state === "CONNECTED" && !appState.isClientReady) {
+      logger.info("CLIENT", "State is CONNECTED, checking if ready...");
+      setTimeout(() => {
+        try {
+          if (client.info && client.info.wid && !appState.isClientReady) {
+            logger.warn("CLIENT", "State is CONNECTED but ready event didn't fire - manually setting state");
+            appState.isClientReady = true;
+            appState.isAuthenticated = true;
+            appState.currentQR = null;
+            broadcastSSE({ type: "ready", message: "Client Ready for Messages" });
+          }
+        } catch (e) {
+          // Ignore
+        }
+      }, 1000);
+    }
+  };
+  client.on("change_state", changeStateHandler);
+  handlers.push({ event: "change_state", handler: changeStateHandler });
+  
+  // Loading Screen Event - track loading progress
+  const loadingScreenHandler = (percent, message) => {
+    logger.info("EVENT", `Loading: ${percent}% - ${message || ""}`);
+  };
+  client.on("loading_screen", loadingScreenHandler);
+  handlers.push({ event: "loading_screen", handler: loadingScreenHandler });
 
   // Ready Event
   const readyHandler = () => {
@@ -505,6 +561,9 @@ const setupClientEventHandlers = () => {
     appState.isClientReady = true;
     appState.isAuthenticated = true;
     appState.currentQR = null;
+    
+    // Stop ready check since we're ready now
+    stopReadyCheck();
     
     // Log client info for debugging
     try {
@@ -528,6 +587,9 @@ const setupClientEventHandlers = () => {
     appState.isClientReady = false;
     appState.currentQR = null;
     appState.qrEventFired = false;
+    
+    // Stop ready check
+    stopReadyCheck();
 
     broadcastSSE({
       type: "disconnected",
@@ -565,6 +627,62 @@ const setupClientEventHandlers = () => {
 
   // Store handlers for cleanup
   clientEventHandlers.set(client, handlers);
+};
+
+// ==================== READY STATE CHECKER ====================
+const checkClientReady = () => {
+  if (!appState.client || !appState.isAuthenticated || appState.isClientReady) {
+    return;
+  }
+
+  try {
+    const info = appState.client.info;
+    if (info && info.wid) {
+      // Client is actually ready but state wasn't updated
+      logger.warn("CLIENT", "Detected client is ready via state check - updating state");
+      appState.isClientReady = true;
+      appState.currentQR = null;
+      broadcastSSE({ type: "ready", message: "Client Ready for Messages" });
+      
+      // Stop the interval since we're ready now
+      if (appState.readyCheckInterval) {
+        clearInterval(appState.readyCheckInterval);
+        appState.readyCheckInterval = null;
+      }
+    }
+  } catch (e) {
+    // Ignore errors
+  }
+};
+
+const startReadyCheck = () => {
+  // Clear any existing interval
+  if (appState.readyCheckInterval) {
+    clearInterval(appState.readyCheckInterval);
+  }
+  
+  // Start checking every 2 seconds for up to 60 seconds
+  let checks = 0;
+  const maxChecks = 30; // 30 checks * 2 seconds = 60 seconds max
+  
+  appState.readyCheckInterval = setInterval(() => {
+    checks++;
+    if (checks > maxChecks || appState.isClientReady) {
+      if (appState.readyCheckInterval) {
+        clearInterval(appState.readyCheckInterval);
+        appState.readyCheckInterval = null;
+      }
+      return;
+    }
+    checkClientReady();
+  }, 2000);
+};
+
+const stopReadyCheck = () => {
+  if (appState.readyCheckInterval) {
+    clearInterval(appState.readyCheckInterval);
+    appState.readyCheckInterval = null;
+  }
 };
 
 // ==================== SSE BROADCAST ====================
@@ -751,6 +869,16 @@ registerRoute("get", "/status", (req, res) => {
         };
         // If client.info exists, the client IS ready (real state, not simulation)
         actualReadyState = true;
+        
+        // Update appState if it's not set but client is actually ready
+        if (!appState.isClientReady && actualReadyState) {
+          logger.warn("STATUS", "Client is ready but appState wasn't updated - fixing state");
+          appState.isClientReady = true;
+          appState.isAuthenticated = true;
+          appState.currentQR = null;
+          // Broadcast ready event to clients
+          broadcastSSE({ type: "ready", message: "Client Ready for Messages" });
+        }
       }
     } catch (e) {
       // Ignore errors accessing client info
@@ -935,6 +1063,9 @@ registerRoute("post", "/api/disconnect", requireAuth, async (req, res) => {
 
   try {
     appState.isManuallyDisconnected = true;
+    
+    // Stop ready check
+    stopReadyCheck();
 
     // Reset state
     appState.currentQR = null;
@@ -1195,6 +1326,9 @@ const server = app.listen(PORT, HOST, () => {
 // ==================== GRACEFUL SHUTDOWN ====================
 const shutdown = async signal => {
   console.log(`\n[SHUTDOWN] Received ${signal}, shutting down gracefully...`);
+
+  // Stop ready check
+  stopReadyCheck();
 
   if (appState.client) {
     // Clean up event handlers
