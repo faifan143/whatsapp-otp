@@ -380,14 +380,7 @@ const setupClientEventHandlers = () => {
     logger.success("EVENT", "AUTHENTICATED");
     appState.isAuthenticated = true;
     broadcastSSE({ type: "qr_scanned", message: "QR Scanned Successfully" });
-    
-    // The ready event should fire shortly after authenticated
-    // Set a timeout to log if ready doesn't fire within reasonable time
-    setTimeout(() => {
-      if (!appState.isClientReady && appState.isAuthenticated) {
-        logger.warn("EVENT", "Authenticated but ready event not fired yet (waiting...)");
-      }
-    }, 10000); // Check after 10 seconds
+    // Ready event should fire automatically after authenticated
   };
   client.on("authenticated", authenticatedHandler);
   handlers.push({ event: "authenticated", handler: authenticatedHandler });
@@ -634,21 +627,16 @@ registerRoute("get", "/status", (req, res) => {
   
   if (appState.client) {
     try {
-      // Try to access client.info - if it exists, the client is actually ready
+      // Get actual client state - client.info is only available when ready
       const info = appState.client.info;
-      if (info) {
+      if (info && info.wid) {
         clientInfo = {
           wid: info.wid || null,
           me: info.me || null,
           pushname: info.pushname || null
         };
-        // If info exists but isClientReady is false, update it
-        if (!appState.isClientReady && info.wid) {
-          logger.info("STATUS", "Client has info but isClientReady was false - correcting state");
-          appState.isClientReady = true;
-          appState.isAuthenticated = true;
-          actualReadyState = true;
-        }
+        // If client.info exists, the client IS ready (real state, not simulation)
+        actualReadyState = true;
       }
     } catch (e) {
       // Ignore errors accessing client info
