@@ -11,7 +11,6 @@ const PORT = process.env.PORT || 3000;
 // Middleware
 app.use(express.json());
 app.use(cookieParser());
-app.use(express.static("public"));
 
 // Constants
 const LOGIN_EMAIL = process.env.LOGIN_EMAIL;
@@ -382,6 +381,9 @@ app.get("/otp-service/", (req, res) => {
     });
   }
 });
+
+// Serve static files (CSS, JS, images, etc.) - placed after API routes
+app.use(express.static("public"));
 
 // 404 handler
 app.use((req, res) => {
