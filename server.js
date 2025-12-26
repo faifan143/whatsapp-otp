@@ -224,44 +224,37 @@ const getChromiumPath = () => {
 
 const chromiumPath = getChromiumPath();
 
-// Base Puppeteer config - will be customized per client instance
-const getPuppeteerConfig = (userDataDir) => {
-  const config = {
-    headless: true,
-    args: [
-      "--no-sandbox",
-      "--disable-setuid-sandbox",
-      "--disable-dev-shm-usage",
-      "--disable-gpu",
-      "--mute-audio",
-      "--disable-extensions",
-      "--disable-plugins",
-      "--disable-background-timer-throttling",
-      "--disable-backgrounding-occluded-windows",
-      "--disable-renderer-backgrounding",
-      "--disable-default-apps",
-      "--disable-sync",
-      "--no-first-run",
-      "--no-default-browser-check"
-    ]
-  };
-
-  // Use unique user data directory to avoid singleton lock conflicts
-  if (userDataDir) {
-    config.userDataDir = userDataDir;
-    config.args.push(`--user-data-dir=${userDataDir}`);
-  }
-
-  if (chromiumPath) {
-    config.executablePath = chromiumPath;
-    // For snap chromium, we need additional args
-    if (chromiumPath.includes("/snap/")) {
-      config.args.push("--disable-features=VizDisplayCompositor");
-    }
-  }
-
-  return config;
+// Base Puppeteer config
+const puppeteerConfig = {
+  headless: true,
+  args: [
+    "--no-sandbox",
+    "--disable-setuid-sandbox",
+    "--disable-dev-shm-usage",
+    "--disable-gpu",
+    "--mute-audio",
+    "--disable-extensions",
+    "--disable-plugins",
+    "--disable-background-timer-throttling",
+    "--disable-backgrounding-occluded-windows",
+    "--disable-renderer-backgrounding",
+    "--disable-default-apps",
+    "--disable-sync",
+    "--no-first-run",
+    "--no-default-browser-check",
+    // Disable singleton lock to allow multiple instances
+    "--disable-features=TranslateUI",
+    "--disable-ipc-flooding-protection"
+  ]
 };
+
+if (chromiumPath) {
+  puppeteerConfig.executablePath = chromiumPath;
+  // For snap chromium, we need additional args
+  if (chromiumPath.includes("/snap/")) {
+    puppeteerConfig.args.push("--disable-features=VizDisplayCompositor");
+  }
+}
 
 // ==================== FILESYSTEM UTILITIES ====================
 const cleanupAuthDirectory = () => {
@@ -303,47 +296,28 @@ const createAndSetupClient = (useNewId = false) => {
 
   logger.info("CLIENT", `Creating new client with ID: ${appState.clientId}`);
 
-  // Create unique user data directory for this client to avoid singleton lock conflicts
-  const userDataDir = path.join(AUTH_DIR, "puppeteer", appState.clientId);
-  
-  // Clean up any existing user data directory to avoid conflicts
-  if (fs.existsSync(userDataDir)) {
-    try {
-      fs.rmSync(userDataDir, { recursive: true, force: true });
-      logger.info("CLIENT", `Cleaned up existing user data dir: ${userDataDir}`);
-    } catch (err) {
-      logger.warn("CLIENT", `Failed to clean user data dir: ${err.message}`);
-    }
-  }
-
-  // Create the directory
-  try {
-    fs.mkdirSync(userDataDir, { recursive: true });
-  } catch (err) {
-    logger.warn("CLIENT", `Failed to create user data dir: ${err.message}`);
-  }
-
-  // Clean up any stale singleton lock files in common locations
+  // Clean up any stale singleton lock files before creating client
+  // This helps prevent lock conflicts when multiple instances try to start
   const lockPaths = [
     "/root/snap/chromium/common/chromium/SingletonLock",
-    path.join(userDataDir, "SingletonLock"),
-    path.join(userDataDir, "SingletonSocket"),
-    path.join(userDataDir, "SingletonCookie")
+    "/root/snap/chromium/common/chromium/SingletonSocket",
+    "/root/snap/chromium/common/chromium/SingletonCookie"
   ];
 
   lockPaths.forEach(lockPath => {
     if (fs.existsSync(lockPath)) {
       try {
+        // Try to remove the lock file
         fs.unlinkSync(lockPath);
         logger.info("CLIENT", `Removed stale lock file: ${lockPath}`);
       } catch (err) {
-        // Ignore errors - file might be in use or doesn't exist
+        // Lock file might be in use - try to kill any stale processes
+        if (err.code === 'EBUSY' || err.code === 'EPERM') {
+          logger.warn("CLIENT", `Lock file in use: ${lockPath} - may need manual cleanup`);
+        }
       }
     }
   });
-
-  // Get Puppeteer config with unique user data directory
-  const puppeteerConfig = getPuppeteerConfig(userDataDir);
 
   appState.client = new Client({
     authStrategy: new LocalAuth({
@@ -732,6 +706,31 @@ registerRoute("get", "/api/qr", requireAuth, rateLimit(RATE_LIMIT_MAX_REQUESTS.q
     // Start fresh connection
     logger.info("QR", "Starting fresh connection");
 
+    // Destroy existing client if it exists before creating a new one
+    if (appState.client) {
+      try {
+        logger.info("QR", "Destroying existing client before creating new one...");
+        await appState.client.destroy().catch(() => {});
+        // Clean up event handlers
+        if (clientEventHandlers.has(appState.client)) {
+          const handlers = clientEventHandlers.get(appState.client);
+          handlers.forEach(({ event, handler }) => {
+            try {
+              appState.client.removeListener(event, handler);
+            } catch (e) {
+              // Ignore cleanup errors
+            }
+          });
+          clientEventHandlers.delete(appState.client);
+        }
+        appState.client = null;
+        // Wait a moment for cleanup
+        await new Promise(r => setTimeout(r, 1000));
+      } catch (err) {
+        logger.warn("QR", `Error destroying existing client: ${err.message}`);
+      }
+    }
+
     cleanupAuthDirectory();
     appState.isManuallyDisconnected = false;
     createAndSetupClient(true);
@@ -859,19 +858,6 @@ registerRoute("post", "/api/disconnect", requireAuth, async (req, res) => {
       }
 
       appState.client = null;
-    }
-
-    // Clean up user data directory for this client
-    if (appState.clientId) {
-      const userDataDir = path.join(AUTH_DIR, "puppeteer", appState.clientId);
-      if (fs.existsSync(userDataDir)) {
-        try {
-          fs.rmSync(userDataDir, { recursive: true, force: true });
-          logger.info("DISCONNECT", `Cleaned up user data dir: ${userDataDir}`);
-        } catch (err) {
-          logger.warn("DISCONNECT", `Failed to clean user data dir: ${err.message}`);
-        }
-      }
     }
 
     cleanupAuthDirectory();
