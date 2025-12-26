@@ -351,14 +351,57 @@ app.use(`${BASE_PATH}`, authenticate, async (req, res, next) => {
   }
 });
 
-// Serve frontend
-app.get("/", (req, res) => {
-  res.sendFile(path.join(__dirname, "public", "index.html"));
-});
-
 // Health check
 app.get("/health", (req, res) => {
   res.json({ status: "ok" });
+});
+
+// Serve frontend
+app.get("/", (req, res) => {
+  const indexPath = path.join(__dirname, "public", "index.html");
+  if (fs.existsSync(indexPath)) {
+    res.sendFile(indexPath);
+  } else {
+    res.status(200).json({
+      message: "WhatsApp OTP Service",
+      status: "running",
+      setupUrl: "/otp-service/",
+    });
+  }
+});
+
+app.get("/otp-service/", (req, res) => {
+  const indexPath = path.join(__dirname, "public", "index.html");
+  if (fs.existsSync(indexPath)) {
+    res.sendFile(indexPath);
+  } else {
+    res.status(404).json({
+      error: "Frontend not found",
+      message: "Please place index.html in the public/ directory",
+      setupGuide: "See SETUP.md for instructions",
+    });
+  }
+});
+
+// 404 handler
+app.use((req, res) => {
+  res.status(404).json({
+    error: "Not Found",
+    path: req.path,
+    method: req.method,
+  });
+});
+
+// Error handler
+app.use((err, req, res, next) => {
+  console.error("Server error:", err);
+  res.status(500).json({
+    error: "Internal Server Error",
+    message:
+      process.env.NODE_ENV === "production"
+        ? "An error occurred"
+        : err.message,
+  });
 });
 
 // ==================== SERVER STARTUP ====================
