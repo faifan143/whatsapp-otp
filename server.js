@@ -143,7 +143,7 @@ function broadcastToSession(sessionId, data) {
 // ==================== ROUTES ====================
 
 // Login
-app.post(`/otp-service/api/login`, (req, res) => {
+app.post(`${BASE_PATH}/api/login`, (req, res) => {
   const { email, password } = req.body;
 
   if (!email || !password) {
@@ -170,13 +170,13 @@ app.post(`/otp-service/api/login`, (req, res) => {
 });
 
 // Check authentication
-app.get(`/otp-service/api/auth/check`, (req, res) => {
+app.get(`${BASE_PATH}/api/auth/check`, (req, res) => {
   const session = validateSession(req);
   res.json({ authenticated: !!session });
 });
 
 // Logout
-app.post(`/otp-service/api/logout`, authenticate, (req, res) => {
+app.post(`${BASE_PATH}/api/logout`, authenticate, (req, res) => {
   const sessionId = req.sessionId;
 
   // Disconnect WhatsApp
@@ -196,13 +196,13 @@ app.post(`/otp-service/api/logout`, authenticate, (req, res) => {
 });
 
 // Get status
-app.get(`/status`, authenticate, (req, res) => {
+app.get(`${BASE_PATH}/status`, authenticate, (req, res) => {
   const status = getClientStatus(req.sessionId);
   res.json(status);
 });
 
 // Get QR code
-app.get(`/otp-service/api/qr`, authenticate, (req, res) => {
+app.get(`${BASE_PATH}/api/qr`, authenticate, (req, res) => {
   const qr = state.qrCodes.get(req.sessionId);
   const client = state.clients.get(req.sessionId);
 
@@ -219,7 +219,7 @@ app.get(`/otp-service/api/qr`, authenticate, (req, res) => {
 });
 
 // Event stream (SSE)
-app.get(`/otp-service/api/events`, authenticate, (req, res) => {
+app.get(`${BASE_PATH}/api/events`, authenticate, (req, res) => {
   const sessionId = req.sessionId;
 
   res.setHeader("Content-Type", "text/event-stream");
@@ -255,7 +255,7 @@ app.get(`/otp-service/api/events`, authenticate, (req, res) => {
 });
 
 // Disconnect WhatsApp
-app.post(`/otp-service/api/disconnect`, authenticate, async (req, res) => {
+app.post(`${BASE_PATH}/api/disconnect`, authenticate, async (req, res) => {
   const sessionId = req.sessionId;
   const client = state.clients.get(sessionId);
 
@@ -282,7 +282,7 @@ app.post(`/otp-service/api/disconnect`, authenticate, async (req, res) => {
 });
 
 // Send message
-app.post(`/send-message`, authenticate, async (req, res) => {
+app.post(`${BASE_PATH}/send-message`, authenticate, async (req, res) => {
   const { phoneNumber, message } = req.body;
   const sessionId = req.sessionId;
 
@@ -333,7 +333,7 @@ app.post(`/send-message`, authenticate, async (req, res) => {
 });
 
 // Initialize WhatsApp on first request (lazy loading)
-app.use(``, authenticate, async (req, res, next) => {
+app.use(`${BASE_PATH}`, authenticate, async (req, res, next) => {
   const sessionId = req.sessionId;
 
   try {
@@ -364,12 +364,12 @@ app.get("/", (req, res) => {
     res.status(200).json({
       message: "WhatsApp OTP Service",
       status: "running",
-      setupUrl: "/otp-service/",
+      setupUrl: "/",
     });
   }
 });
 
-app.get("/otp-service/", (req, res) => {
+app.get("/", (req, res) => {
   const indexPath = path.join(__dirname, "public", "index.html");
   if (fs.existsSync(indexPath)) {
     res.sendFile(indexPath);
