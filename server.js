@@ -143,7 +143,7 @@ function broadcastToSession(sessionId, data) {
 // ==================== ROUTES ====================
 
 // Login
-app.post(`${BASE_PATH}/api/login`, (req, res) => {
+app.post(`${BASE_PATH}/otp-service/api/login`, (req, res) => {
   const { email, password } = req.body;
 
   if (!email || !password) {
@@ -170,13 +170,13 @@ app.post(`${BASE_PATH}/api/login`, (req, res) => {
 });
 
 // Check authentication
-app.get(`${BASE_PATH}/api/auth/check`, (req, res) => {
+app.get(`${BASE_PATH}/otp-service/api/auth/check`, (req, res) => {
   const session = validateSession(req);
   res.json({ authenticated: !!session });
 });
 
 // Logout
-app.post(`${BASE_PATH}/api/logout`, authenticate, (req, res) => {
+app.post(`${BASE_PATH}/otp-service/api/logout`, authenticate, (req, res) => {
   const sessionId = req.sessionId;
 
   // Disconnect WhatsApp
@@ -202,7 +202,7 @@ app.get(`${BASE_PATH}/status`, authenticate, (req, res) => {
 });
 
 // Get QR code
-app.get(`${BASE_PATH}/api/qr`, authenticate, (req, res) => {
+app.get(`${BASE_PATH}/otp-service/api/qr`, authenticate, (req, res) => {
   const qr = state.qrCodes.get(req.sessionId);
   const client = state.clients.get(req.sessionId);
 
@@ -219,7 +219,7 @@ app.get(`${BASE_PATH}/api/qr`, authenticate, (req, res) => {
 });
 
 // Event stream (SSE)
-app.get(`${BASE_PATH}/api/events`, authenticate, (req, res) => {
+app.get(`${BASE_PATH}/otp-service/api/events`, authenticate, (req, res) => {
   const sessionId = req.sessionId;
 
   res.setHeader("Content-Type", "text/event-stream");
@@ -255,7 +255,7 @@ app.get(`${BASE_PATH}/api/events`, authenticate, (req, res) => {
 });
 
 // Disconnect WhatsApp
-app.post(`${BASE_PATH}/api/disconnect`, authenticate, async (req, res) => {
+app.post(`${BASE_PATH}/otp-service/api/disconnect`, authenticate, async (req, res) => {
   const sessionId = req.sessionId;
   const client = state.clients.get(sessionId);
 
