@@ -224,37 +224,81 @@ const getChromiumPath = () => {
 
 const chromiumPath = getChromiumPath();
 
-// Base Puppeteer config
-const puppeteerConfig = {
-  headless: true,
-  args: [
-    "--no-sandbox",
-    "--disable-setuid-sandbox",
-    "--disable-dev-shm-usage",
-    "--disable-gpu",
-    "--mute-audio",
-    "--disable-extensions",
-    "--disable-plugins",
-    "--disable-background-timer-throttling",
-    "--disable-backgrounding-occluded-windows",
-    "--disable-renderer-backgrounding",
-    "--disable-default-apps",
-    "--disable-sync",
-    "--no-first-run",
-    "--no-default-browser-check",
-    // Disable singleton lock to allow multiple instances
-    "--disable-features=TranslateUI",
-    "--disable-ipc-flooding-protection"
-  ]
-};
-
-if (chromiumPath) {
-  puppeteerConfig.executablePath = chromiumPath;
-  // For snap chromium, we need additional args
-  if (chromiumPath.includes("/snap/")) {
-    puppeteerConfig.args.push("--disable-features=VizDisplayCompositor");
+// Get Puppeteer config with dynamic user data dir
+const getPuppeteerConfig = (clientId) => {
+  const userDataDir = path.join(__dirname, '.wwebjs_cache', clientId || 'default');
+  
+  // Ensure directory exists
+  if (!fs.existsSync(userDataDir)) {
+    fs.mkdirSync(userDataDir, { recursive: true });
+  } else {
+    // Clean up any existing lock files in this directory
+    try {
+      const chromiumDir = path.join(userDataDir, 'chromium');
+      if (fs.existsSync(chromiumDir)) {
+        const lockFiles = ['SingletonLock', 'SingletonSocket', 'SingletonCookie'];
+        lockFiles.forEach(lockFile => {
+          const lockPath = path.join(chromiumDir, lockFile);
+          if (fs.existsSync(lockPath)) {
+            try {
+              fs.unlinkSync(lockPath);
+              logger.info("CLEANUP", `Removed existing lock: ${lockPath}`);
+            } catch (e) {
+              // Ignore errors
+            }
+          }
+        });
+      }
+    } catch (err) {
+      // Ignore errors during cleanup
+    }
   }
-}
+
+  const config = {
+    headless: true,
+    args: [
+      "--no-sandbox",
+      "--disable-setuid-sandbox",
+      "--disable-dev-shm-usage",
+      "--disable-gpu",
+      "--mute-audio",
+      "--disable-extensions",
+      "--disable-plugins",
+      "--disable-background-timer-throttling",
+      "--disable-backgrounding-occluded-windows",
+      "--disable-renderer-backgrounding",
+      "--disable-default-apps",
+      "--disable-sync",
+      "--no-first-run",
+      "--no-default-browser-check",
+      // Disable singleton lock to allow multiple instances
+      "--disable-features=TranslateUI",
+      "--disable-ipc-flooding-protection",
+      // Critical: Disable singleton process to allow multiple instances
+      "--disable-background-networking",
+      "--disable-breakpad",
+      "--disable-client-side-phishing-detection",
+      "--disable-component-update",
+      "--disable-hang-monitor",
+      "--disable-popup-blocking",
+      "--disable-prompt-on-repost",
+      "--disable-domain-reliability",
+      "--disable-component-extensions-with-background-pages",
+      // Use a unique user data directory per client instance to avoid conflicts
+      `--user-data-dir=${userDataDir}`
+    ]
+  };
+
+  if (chromiumPath) {
+    config.executablePath = chromiumPath;
+    // For snap chromium, we need additional args
+    if (chromiumPath.includes("/snap/")) {
+      config.args.push("--disable-features=VizDisplayCompositor");
+    }
+  }
+
+  return config;
+};
 
 // ==================== FILESYSTEM UTILITIES ====================
 const cleanupAuthDirectory = () => {
@@ -287,7 +331,94 @@ const cleanupAuthDirectory = () => {
 };
 
 // ==================== CLIENT FACTORY ====================
-const createAndSetupClient = (useNewId = false) => {
+// Enhanced singleton lock cleanup
+const cleanupSingletonLocks = async () => {
+  const { exec } = require("child_process");
+  const { promisify } = require("util");
+  const execAsync = promisify(exec);
+
+  // Common lock file paths for snap chromium
+  const lockPaths = [
+    "/root/snap/chromium/common/chromium/SingletonLock",
+    "/root/snap/chromium/common/chromium/SingletonSocket",
+    "/root/snap/chromium/common/chromium/SingletonCookie"
+  ];
+
+  // Try to kill any existing chromium processes first (only if they're orphaned)
+  try {
+    logger.info("CLEANUP", "Checking for orphaned chromium processes...");
+    // Only kill processes that are not part of our current session
+    await execAsync("pkill -f 'chromium.*headless' || true").catch(() => {
+      // Ignore errors - process might not exist
+    });
+    // Wait a bit for processes to terminate
+    await new Promise(r => setTimeout(r, 1500));
+  } catch (err) {
+    logger.warn("CLEANUP", `Could not kill processes: ${err.message}`);
+  }
+
+  // Remove lock files with retries
+  for (const lockPath of lockPaths) {
+    try {
+      if (fs.existsSync(lockPath)) {
+        // Try multiple times with delays
+        for (let i = 0; i < 3; i++) {
+          try {
+            fs.unlinkSync(lockPath);
+            logger.info("CLEANUP", `Removed lock file: ${lockPath}`);
+            break;
+          } catch (err) {
+            if (i < 2) {
+              await new Promise(r => setTimeout(r, 500));
+            } else {
+              // Last attempt failed - try to force remove via command
+              try {
+                await execAsync(`rm -f "${lockPath}" 2>/dev/null || true`);
+                logger.info("CLEANUP", `Force removed lock file: ${lockPath}`);
+              } catch (rmErr) {
+                logger.warn("CLEANUP", `Could not remove ${lockPath}: ${err.message}`);
+              }
+            }
+          }
+        }
+      }
+    } catch (err) {
+      logger.warn("CLEANUP", `Error cleaning ${lockPath}: ${err.message}`);
+    }
+  }
+
+  // Clean up any lock files in cache directories
+  const cacheDir = path.join(__dirname, '.wwebjs_cache');
+  if (fs.existsSync(cacheDir)) {
+    try {
+      const dirs = fs.readdirSync(cacheDir);
+      for (const dir of dirs) {
+        const dirPath = path.join(cacheDir, dir);
+        if (fs.statSync(dirPath).isDirectory()) {
+          const chromiumDir = path.join(dirPath, 'chromium');
+          if (fs.existsSync(chromiumDir)) {
+            const lockFiles = ['SingletonLock', 'SingletonSocket', 'SingletonCookie'];
+            for (const lockFile of lockFiles) {
+              const lockPath = path.join(chromiumDir, lockFile);
+              if (fs.existsSync(lockPath)) {
+                try {
+                  fs.unlinkSync(lockPath);
+                  logger.info("CLEANUP", `Removed cache lock: ${lockPath}`);
+                } catch (e) {
+                  // Ignore
+                }
+              }
+            }
+          }
+        }
+      }
+    } catch (err) {
+      // Ignore errors
+    }
+  }
+};
+
+const createAndSetupClient = async (useNewId = false) => {
   if (useNewId) {
     appState.clientId = crypto.randomBytes(8).toString("hex");
   } else if (!appState.clientId) {
@@ -296,28 +427,11 @@ const createAndSetupClient = (useNewId = false) => {
 
   logger.info("CLIENT", `Creating new client with ID: ${appState.clientId}`);
 
-  // Clean up any stale singleton lock files before creating client
-  // This helps prevent lock conflicts when multiple instances try to start
-  const lockPaths = [
-    "/root/snap/chromium/common/chromium/SingletonLock",
-    "/root/snap/chromium/common/chromium/SingletonSocket",
-    "/root/snap/chromium/common/chromium/SingletonCookie"
-  ];
+  // Aggressively clean up singleton locks before creating client
+  await cleanupSingletonLocks();
 
-  lockPaths.forEach(lockPath => {
-    if (fs.existsSync(lockPath)) {
-      try {
-        // Try to remove the lock file
-        fs.unlinkSync(lockPath);
-        logger.info("CLIENT", `Removed stale lock file: ${lockPath}`);
-      } catch (err) {
-        // Lock file might be in use - try to kill any stale processes
-        if (err.code === 'EBUSY' || err.code === 'EPERM') {
-          logger.warn("CLIENT", `Lock file in use: ${lockPath} - may need manual cleanup`);
-        }
-      }
-    }
-  });
+  // Get puppeteer config with unique user data dir for this client
+  const puppeteerConfig = getPuppeteerConfig(appState.clientId);
 
   appState.client = new Client({
     authStrategy: new LocalAuth({
@@ -721,7 +835,7 @@ registerRoute("get", "/api/qr", requireAuth, rateLimit(RATE_LIMIT_MAX_REQUESTS.q
 
     cleanupAuthDirectory();
     appState.isManuallyDisconnected = false;
-    createAndSetupClient(true);
+    await createAndSetupClient(true);
 
     appState.qrEventFired = false;
     appState.currentQR = null;
