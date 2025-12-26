@@ -333,21 +333,32 @@ app.post(`${BASE_PATH}/send-message`, authenticate, async (req, res) => {
 });
 
 // Initialize WhatsApp on first request (lazy loading)
-app.use(`${BASE_PATH}`, authenticate, async (req, res, next) => {
-  const sessionId = req.sessionId;
-
-  try {
-    if (!state.clients.has(sessionId)) {
-      // Non-blocking initialization
-      initializeWhatsAppClient(sessionId).catch((error) => {
-        console.error("Client initialization error:", error);
-      });
-    }
-    next();
-  } catch (error) {
-    console.error("Middleware error:", error);
-    next();
+// Exclude login and auth check routes from this middleware
+app.use(`${BASE_PATH}`, (req, res, next) => {
+  // Skip authentication for login and auth check routes
+  // req.path is relative to the mount point when using app.use()
+  const path = req.path || req.originalUrl;
+  if (path.includes('/api/login') || path.includes('/api/auth/check')) {
+    return next();
   }
+  
+  // For all other routes, require authentication
+  authenticate(req, res, async () => {
+    const sessionId = req.sessionId;
+
+    try {
+      if (!state.clients.has(sessionId)) {
+        // Non-blocking initialization
+        initializeWhatsAppClient(sessionId).catch((error) => {
+          console.error("Client initialization error:", error);
+        });
+      }
+      next();
+    } catch (error) {
+      console.error("Middleware error:", error);
+      next();
+    }
+  });
 });
 
 // Health check
@@ -369,7 +380,7 @@ app.get("/", (req, res) => {
   }
 });
 
-app.get("/", (req, res) => {
+app.get("/otp-service/", (req, res) => {
   const indexPath = path.join(__dirname, "public", "index.html");
   if (fs.existsSync(indexPath)) {
     res.sendFile(indexPath);
